@@ -1,6 +1,5 @@
 # GeoSOT Open Source Package
 
-口径与论文 `main.tex` / `appendix.tex` 一致：**编码→导入 → 四个空间算子 → 两个城市应用**。
 
 Scope matches the paper: **encode → import → four spatial operators → two urban applications**.
 

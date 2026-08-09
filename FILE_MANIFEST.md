@@ -35,13 +35,8 @@ Scope matches the paper: **encode → import → four spatial operators → two 
 
 根目录另有：[`CONFIG.md`](CONFIG.md)、[`.env.example`](.env.example)。
 
-## 5. 明确未纳入 / Excluded
 
-- multiscale_kg_vs_postgis.py
-- resident_distance / resident_hometown_knn_*
-- 出图/分析脚本、历史版本、CSV/cache、论文/专利原稿、诊断探针
-
-## 6. Open-source hygiene / 开源处理说明
+## 5. Open-source hygiene / 开源处理说明
 
 - Python 源码中的**中文注释已补英文**（`中文 / English` 或中文行 + 英文行）。
   Chinese comments in `.py` files are bilingual.

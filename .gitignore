@@ -1,0 +1,48 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.cache/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Restricted data
+data/raw/
+data/private/
+raw_data/
+private_data/
+restricted_data/
+resident_data/
+neo4j-data/
+postgres-data/
+
+# Database dumps and archives
+*.dump
+*.bak
+*.7z
+*.zip
+
+# Generated files
+logs/
+tmp/
+paper_figures/
+benchmark_outputs/
+
+# CSV files are ignored by default
+*.csv
+
+# Curated public results and examples may be included
+!results/
+!results/**/*.csv
+!examples/
+!examples/**/*.csv

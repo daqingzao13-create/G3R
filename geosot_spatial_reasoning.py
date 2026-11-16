@@ -1,42 +1,23 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-GeoSOT 空间推理模块 - 基于 BFS 的点与点空间推理
-/ GeoSOT spatial reasoning module — BFS-based point-to-point spatial reasoning
+GeoSOT point-to-point distance and direction reasoning through Neo4j grid adjacency.
 
-基于 GB/T 40087-2021 编码体系和 Neo4j 知识图谱中的网格方向关系，
-通过图遍历（BFS）实现两个 GeoSOT 编码点之间的距离和方向推理。
-/ Based on the GB/T 40087-2021 coding system and grid direction relations in a Neo4j
-knowledge graph, use graph traversal (BFS) to infer distance and direction between
-two GeoSOT-coded points.
+Read level-digit chains L1..L32 through CC_HAS_LEVEL_k_DIGIT, find the first differing
+level, then use BFS over EAST_OF/NORTH_OF to obtain offsets at that and deeper levels.
+Convert DMS cell steps to lon/lat offsets, decode the common-parent reference, reconstruct
+the two positions, and evaluate CGCS2000 Vincenty distance. Optional PostGIS coordinates
+provide an accuracy reference.
 
-算法原理（V2 方案） / Algorithm (V2):
-1. 从 Neo4j 查询两个编码的层级数字链（L1~L32，通过 CC_HAS_LEVEL_k_DIGIT 关系）
-   / Query level digit chains (L1–L32 via CC_HAS_LEVEL_k_DIGIT) from Neo4j
-2. 逐级比较找到首个分异层级 Ld / Find first differing level Ld
-3. 在 Ld 及更深层级，通过 BFS 遍历 EAST_OF / NORTH_OF 关系计算网格位置差
-   / At Ld and deeper levels, BFS EAST_OF / NORTH_OF to compute grid offsets
-4. 将各级网格偏移量转换为经纬度偏移（基于 DMS 编码的网格尺寸）
-   / Convert per-level grid offsets to lon/lat offsets (DMS grid sizes)
-5. 通过解码共同父网格获取参考坐标，加上图推理偏移量得到估计坐标
-   / Decode common parent grid as reference; add graph offsets for estimated coords
-6. 使用 Vincenty 公式（CGCS2000 椭球）计算大地测量距离
-   / Vincenty formula (CGCS2000 ellipsoid) for geodetic distance
-7. 可选：连接 PostGIS (public.poi_new) 获取要素实际坐标作为精度基准
-   / Optional: PostGIS (public.poi_new) actual coords as accuracy baseline
+Comparisons distinguish graph-versus-grid-center mathematical agreement from graph-versus-
+PostGIS coordinate quantization error.
 
-精度对比体系 / Accuracy comparison:
-- 解码对比：图推理结果 vs 网格中心解码（code_to_center），衡量图推理的数学一致性
-  / Decode check: graph vs code_to_center (math consistency of graph reasoning)
-- PostGIS 对比：图推理结果 vs PostGIS 实际坐标（精度基准），衡量网格编码的空间精度损失
-  / PostGIS check: graph vs real coords (spatial precision loss of grid coding)
-
-使用方法 / Usage:
-    python geosot_spatial_reasoning.py --verify                    # 验证图结构 / verify graph
-    python geosot_spatial_reasoning.py <编码1> <编码2>             # 两点推理（含PostGIS对比） / pair reasoning (+PostGIS)
-    python geosot_spatial_reasoning.py --no-compare <编码1> <编码2> # 不对比直接解码 / skip decode compare
-    python geosot_spatial_reasoning.py --no-postgis <编码1> <编码2> # 不对比PostGIS / skip PostGIS
-    python geosot_spatial_reasoning.py                             # 交互模式 / interactive
+Usage:
+    python geosot_spatial_reasoning.py --verify
+    python geosot_spatial_reasoning.py <code_a> <code_b>
+    python geosot_spatial_reasoning.py --no-compare <code_a> <code_b>
+    python geosot_spatial_reasoning.py --no-postgis <code_a> <code_b>
+    python geosot_spatial_reasoning.py
 """
 
 import math
@@ -59,7 +40,7 @@ PG_CONFIG = {
 
 
 # ============================================================================
-# GeoSOT 编码辅助函数 / GeoSOT encoding helpers
+# GeoSOT encoding helpers
 # ============================================================================
 
 DIGIT_TO_ROWCOL = {
@@ -82,7 +63,7 @@ def _digit_to_bits(digit: str) -> Tuple[str, str]:
 
 
 def _bits31_to_degree(bits31: str) -> float:
-    """31 位二进制（8度+6分+6秒+11秒以下）→ 十进制度 / 31-bit binary (8°+6′+6″+11 sub-arcsec) → decimal degrees"""
+    """31-bit binary (8°+6′+6″+11 sub-arcsec) → decimal degrees"""
     d = int(bits31[0:8], 2)
     m = int(bits31[8:14], 2)
     s = int(bits31[14:20], 2)
@@ -91,10 +72,7 @@ def _bits31_to_degree(bits31: str) -> float:
 
 
 def code_to_bbox(code: str) -> Tuple[float, float, float, float]:
-    """
-    GeoSOT 编码 → (min_lon, max_lon, min_lat, max_lat)
-    / GeoSOT code → (min_lon, max_lon, min_lat, max_lat)
-    """
+    """GeoSOT code → (min_lon, max_lon, min_lat, max_lat)"""
     code = code.strip().upper()
     body = code[1:]
     refine = body[1:]
@@ -116,19 +94,19 @@ def code_to_bbox(code: str) -> Tuple[float, float, float, float]:
 
 
 def code_to_center(code: str) -> Tuple[float, float]:
-    """GeoSOT 编码 → (center_lon, center_lat) / GeoSOT code → (center_lon, center_lat)"""
+    """GeoSOT code → (center_lon, center_lat)"""
     lo_lon, hi_lon, lo_lat, hi_lat = code_to_bbox(code)
     return ((lo_lon + hi_lon) / 2.0, (lo_lat + hi_lat) / 2.0)
 
 
 def reconstruct_code(chain: Dict[int, str], up_to_level: int) -> str:
-    """从网格链重建 GeoSOT 编码前缀 / Rebuild GeoSOT code prefix from grid chain"""
+    """Rebuild GeoSOT code prefix from grid chain"""
     digits = [chain.get(lv, "0") for lv in range(1, up_to_level + 1)]
     return "G" + "".join(digits)
 
 
 def is_valid_g0_code(code: str) -> bool:
-    """检查是否为合法的东北半球 GeoSOT 编码 / Check valid NE-hemisphere GeoSOT code"""
+    """Check valid NE-hemisphere GeoSOT code"""
     if not code or not code.startswith("G"):
         return False
     body = code[1:]
@@ -141,21 +119,13 @@ def is_valid_g0_code(code: str) -> bool:
 
 def _compute_grid_step(level: int) -> Tuple[float, float]:
     """
-    计算指定层级网格的精确步长（相邻网格中心距离），单位度。
-    / Exact grid step at a level (center-to-center), in degrees.
+    Return the exact adjacent-cell center step at a level, in degrees.
 
-    GeoSOT 31 位 DMS 编码结构 / GeoSOT 31-bit DMS layout:
-      位 0-7   (8位): 度     → 层级 2-9 / bits 0–7 (8): degrees → levels 2–9
-      位 8-13  (6位): 分     → 层级 10-15 / bits 8–13 (6): minutes → levels 10–15
-      位 14-19 (6位): 秒     → 层级 16-21 / bits 14–19 (6): seconds → levels 16–21
-      位 20-30 (11位): 秒以下 → 层级 22-32 / bits 20–30 (11): sub-arcsec → levels 22–32
+    The 31 DMS bits encode degrees in bits 0..7 (levels 2..9), minutes in 8..13 (10..15),
+    seconds in 14..19 (16..21), and fractional seconds in 20..30 (22..32).
 
-    使用 code_to_bbox 的 "全填1" 方式会将分/秒字段扩展到 0-63，
-    但实际 DMS 只允许 0-59，导致 bbox 方式高估网格尺寸约 6.78%。
-    本方法直接根据 DMS 位权计算精确步长，避免该误差。
-    / Filling remaining bits with 1 in code_to_bbox expands min/sec to 0–63,
-      while DMS allows only 0–59, overestimating size by ~6.78%. This method
-      uses DMS bit weights for exact step size.
+    An all-one bbox fill expands minute/second fields to 0..63 although physical DMS values end
+    at 59, overestimating the cell size by about 6.78%. Use the actual DMS bit weights instead.
     """
     if level <= 1:
         return (180.0, 90.0)
@@ -178,7 +148,7 @@ GRID_SIZES: Dict[int, Tuple[float, float]] = {
 
 def vincenty_distance(lat1: float, lon1: float,
                       lat2: float, lon2: float) -> float:
-    """Vincenty 椭球体距离（CGCS2000 / EPSG:4490），返回公里 / Vincenty ellipsoidal distance (CGCS2000 / EPSG:4490), km"""
+    """CGCS2000 / EPSG:4490 Vincenty ellipsoidal distance, returned in kilometers."""
     a = 6378.137
     f = 1 / 298.257222101
     b = a * (1 - f)
@@ -222,7 +192,7 @@ def vincenty_distance(lat1: float, lon1: float,
 
 
 # ============================================================================
-# 高性能计算函数 / High-performance compute helpers
+# High-performance compute helpers
 # ============================================================================
 
 _INV60 = 1.0 / 60.0
@@ -238,12 +208,10 @@ _OFF_NS = (-0.5, -0.5, 0.5, 0.5)
 
 def _bits31_to_degree_int(val: int) -> float:
     """
-    31 位整数 DMS → 十进制度（整数位运算，无字符串解析）。
-    / 31-bit integer DMS → decimal degrees (integer bit ops, no string parse).
+    31-bit integer DMS → decimal degrees (integer bit ops, no string parse).
 
-    @param val 31 位整数（8 位度 + 6 位分 + 6 位秒 + 11 位秒以下）
-               / 31-bit int (8° + 6′ + 6″ + 11 sub-arcsec bits)
-    @returns 十进制度 / decimal degrees
+               31-bit int (8° + 6′ + 6″ + 11 sub-arcsec bits)
+    decimal degrees
     """
     return (
         ((val >> 23) & 0xFF)
@@ -254,7 +222,10 @@ def _bits31_to_degree_int(val: int) -> float:
 
 def _spherical_bearing(lon1: float, lat1: float,
                        lon2: float, lat2: float) -> float:
-    """球面大圆初始方位角（0 = 正北，顺时针，度），用作椭球反算不收敛时的回退。 / Spherical great-circle initial bearing (0=N, clockwise, deg); fallback when ellipsoidal inverse fails."""
+    """
+    Spherical great-circle initial bearing (0=N, clockwise, deg); fallback when ellipsoidal
+    inverse fails.
+    """
     la1 = math.radians(lat1)
     la2 = math.radians(lat2)
     dlon = math.radians(lon2 - lon1)
@@ -267,22 +238,18 @@ def _spherical_bearing(lon1: float, lat1: float,
 def compute_bearing(lon1: float, lat1: float,
                     lon2: float, lat2: float) -> float:
     """
-    计算方位角（0 = 正北，顺时针，度）。
-    / Compute bearing (0 = north, clockwise, degrees).
+    Compute bearing (0 = north, clockwise, degrees).
 
-    采用 Vincenty 椭球反算（CGCS2000 / EPSG:4490）得到起点处的大地测线正
-    方位角，与 vincenty_distance 及 PostGIS ST_Azimuth 的椭球口径一致；对
-    重合点或极少数不收敛情形回退到球面大圆方位。
-    / Vincenty ellipsoidal inverse (CGCS2000 / EPSG:4490) for forward azimuth
+    Vincenty ellipsoidal inverse (CGCS2000 / EPSG:4490) for forward azimuth
       at the start point, consistent with vincenty_distance and PostGIS
       ST_Azimuth; fall back to spherical bearing for coincident points or rare
       non-convergence.
 
-    @param lon1 起点经度 / start longitude
-    @param lat1 起点纬度 / start latitude
-    @param lon2 终点经度 / end longitude
-    @param lat2 终点纬度 / end latitude
-    @returns 方位角（度） / bearing (degrees)
+    start longitude
+    start latitude
+    end longitude
+    end latitude
+    bearing (degrees)
     """
     f = 1.0 / 298.257222101
     L = math.radians(lon2 - lon1)
@@ -299,7 +266,7 @@ def compute_bearing(lon1: float, lat1: float,
             (cos_u2 * sin_lam) ** 2
             + (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_lam) ** 2)
         if sin_sigma == 0.0:
-            return 0.0  # 重合点，方位无定义 / coincident points; bearing undefined
+            return 0.0  # The bearing is undefined for coincident points.
         cos_sigma = sin_u1 * sin_u2 + cos_u1 * cos_u2 * cos_lam
         sigma = math.atan2(sin_sigma, cos_sigma)
         sin_alpha = cos_u1 * cos_u2 * sin_lam / sin_sigma
@@ -324,19 +291,15 @@ def compute_bearing(lon1: float, lat1: float,
 
 def fast_code_to_center(code: str) -> Tuple[float, float]:
     """
-    高性能 GeoSOT 编码 → (center_lon, center_lat)。
-    / Fast GeoSOT code → (center_lon, center_lat).
+    Fast GeoSOT code → (center_lon, center_lat).
 
-    使用整数移位/掩码替代字符串拼接和 int(str, 2) 解析。
-    全精度编码（31 位细化）只需 2 次 DMS 转换而非 4 次。
-    / Integer shift/mask instead of string concat and int(str, 2).
+    Integer shift/mask instead of string concat and int(str, 2).
       Full-precision codes (31 refine bits) need 2 DMS conversions, not 4.
 
-    调用者需确保 code 已大写且无前后空白。
-    / Caller must ensure code is uppercased and stripped.
+    Caller must ensure code is uppercased and stripped.
 
-    @param code GeoSOT 编码字符串（如 "G0123..."） / GeoSOT code string
-    @returns (center_lon, center_lat) 十进制度 / decimal degrees
+    GeoSOT code string
+    decimal degrees
     """
     refine = code[2:]
     n = len(refine)
@@ -360,7 +323,7 @@ def fast_code_to_center(code: str) -> Tuple[float, float]:
     )
 
 
-# Vincenty 加速：优先 Numba JIT，回退到纯 Python / Vincenty accel: Numba JIT preferred, pure Python fallback
+# Vincenty accel: Numba JIT preferred, pure Python fallback
 vincenty_fast = vincenty_distance
 HAS_NUMBA = False
 
@@ -369,7 +332,7 @@ try:
 
     @_njit(cache=True)
     def _vincenty_numba(lat1, lon1, lat2, lon2):
-        """Numba JIT 编译的 Vincenty 椭球距离（CGCS2000），返回 km / Numba-JIT Vincenty ellipsoidal distance (CGCS2000), km"""
+        """Numba-JIT Vincenty ellipsoidal distance (CGCS2000), km"""
         a = 6378.137
         f = 1.0 / 298.257222101
         b_ax = a * (1.0 - f)
@@ -435,22 +398,15 @@ def fast_graph_reasoning_pair(
     code_a: str, code_b: str,
 ) -> Tuple[float, float]:
     """
-    融合式图推理距离计算，直接从编码字符串到 (distance_m, bearing_deg)。
-    / Fused graph-reasoning distance: codes → (distance_m, bearing_deg).
+    Fused code-to-distance graph kernel returning (distance_m, bearing_deg).
 
-    相比 graph_reasoning_pair 的优化 / vs graph_reasoning_pair:
-      - 跳过 chain dict 构建，直接比较编码字符 / skip chain dict; compare code chars
-      - 内联参考点坐标计算，避免 reconstruct_code → code_to_center 往返
-        / inline reference coords; avoid reconstruct_code → code_to_center
-      - 预计算元组索引替代 dict.get() / precomputed tuple index vs dict.get()
-      - 使用 vincenty_fast（Numba 可用时自动加速） / vincenty_fast (Numba when available)
+    Avoid chain dictionaries by comparing code characters, inline reference-coordinate
+    calculation, use precomputed tuple indexes, and call vincenty_fast with optional Numba
+    acceleration. Callers must provide uppercase, trimmed codes.
 
-    调用者需确保 code 已大写且无前后空白。
-    / Caller must ensure code is uppercased and stripped.
-
-    @param code_a 第一个 GeoSOT 编码 / first GeoSOT code
-    @param code_b 第二个 GeoSOT 编码 / second GeoSOT code
-    @returns (distance_m, bearing_deg)
+    @param code_a First GeoSOT code.
+    @param code_b Second GeoSOT code.
+    @returns (distance_m, bearing_deg).
     """
     body_a = code_a[1:]
     body_b = code_b[1:]
@@ -508,24 +464,15 @@ def fast_graph_reasoning_pair(
 
 
 # ============================================================================
-# GeoSOT 空间推理器 / GeoSOT spatial reasoner
+# GeoSOT spatial reasoner
 # ============================================================================
 
 class GeoSotSpatialReasoner:
     """
-    GeoSOT 空间推理器 - 基于图遍历的空间推理
-    / GeoSOT spatial reasoner — graph-traversal spatial reasoning
-
-    核心算法 / Core algorithm:
-    1. 提取两个 GeoSOT 编码的网格链（L1~L32） / Extract grid chains (L1–L32)
-    2. 找到首个分异层级 diff_level / Find first differing level
-    3. 在 diff_level 及更深层级，通过 BFS 遍历 EAST_OF/NORTH_OF
-       关系计算各级网格的位置差
-       / BFS EAST_OF/NORTH_OF at diff_level+ for per-level position deltas
-    4. 将位置差转换为经纬度偏移 / Convert position deltas to lon/lat offsets
-    5. 解码共同父网格获取参考坐标，加上推理偏移得到估计坐标
-       / Decode common parent as reference; add offsets for estimates
-    6. Vincenty 公式计算椭球体距离 / Vincenty ellipsoidal distance
+    Graph-based GeoSOT spatial reasoner. Extract both level chains, locate the first differing
+    level, traverse EAST_OF/NORTH_OF with BFS to obtain level offsets, convert them to
+    geographic offsets, reconstruct positions from the common-parent reference, and evaluate
+    Vincenty distance.
     """
 
     def __init__(self, verbose: bool = True, use_cache: bool = True,
@@ -554,7 +501,7 @@ class GeoSotSpatialReasoner:
             self._preload_neighbor_cache()
 
     # ------------------------------------------------------------------
-    # 基础设施 / Infrastructure
+    # Infrastructure
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -574,7 +521,7 @@ class GeoSotSpatialReasoner:
             return []
 
     def _init_postgis(self):
-        """连接 PostGIS 数据库（public.poi_new） / Connect to PostGIS (public.poi_new)"""
+        """Connect to PostGIS (public.poi_new)"""
         try:
             import psycopg2
             self._pg_conn = psycopg2.connect(**PG_CONFIG)
@@ -591,7 +538,7 @@ class GeoSotSpatialReasoner:
     def _query_postgis_coordinates(
         self, main_code: str,
     ) -> Optional[Tuple[float, float]]:
-        """通过 main_code 从 PostGIS 查询要素的实际坐标 (lon, lat) / Query real feature coords (lon, lat) from PostGIS by main_code"""
+        """Query real feature coords (lon, lat) from PostGIS by main_code"""
         if self._pg_conn is None:
             return None
         try:
@@ -617,7 +564,7 @@ class GeoSotSpatialReasoner:
     def _query_postgis_distance(
         self, main_code_a: str, main_code_b: str,
     ) -> Optional[float]:
-        """利用 PostGIS ST_Distance (geography) 计算两个要素的椭球体距离(米) / Ellipsoidal distance (m) via PostGIS ST_Distance(geography)"""
+        """Ellipsoidal distance (m) via PostGIS ST_Distance(geography)"""
         if self._pg_conn is None:
             return None
         try:
@@ -661,11 +608,11 @@ class GeoSotSpatialReasoner:
                 pass
 
     # ------------------------------------------------------------------
-    # 邻居缓存 / Neighbor cache
+    # Neighbor cache
     # ------------------------------------------------------------------
 
     def _preload_neighbor_cache(self):
-        """预加载所有层级的 EAST_OF / NORTH_OF 关系到内存 / Preload all-level EAST_OF / NORTH_OF relations into memory"""
+        """Preload EAST_OF/NORTH_OF relations from every level into memory."""
         t0 = time.perf_counter()
         total = 0
         for level in range(1, 33):
@@ -721,11 +668,11 @@ class GeoSotSpatialReasoner:
         return str(rows[0]["nc"]) if rows else None
 
     # ------------------------------------------------------------------
-    # 网格链获取 / Grid-chain retrieval
+    # Grid-chain retrieval
     # ------------------------------------------------------------------
 
     def get_grid_chain_from_neo4j(self, main_code: str) -> Dict[int, str]:
-        """从 Neo4j 查询质心码 (GeoSOTCentroidCode) 的层级数字链 / Query level digit chain of a centroid code from Neo4j"""
+        """Query level digit chain of a centroid code from Neo4j"""
         rows = self._run(
             "MATCH (c:GeoSOTCentroidCode {main_code: $code})-[r]->(d) "
             "WHERE type(r) STARTS WITH 'CC_HAS_LEVEL_' "
@@ -746,7 +693,7 @@ class GeoSotSpatialReasoner:
 
     @staticmethod
     def get_grid_chain_from_code(geosot_code: str) -> Dict[int, str]:
-        """直接从 GeoSOT 编码字符串解析网格链（不查数据库） / Parse grid chain from GeoSOT code string (no DB)"""
+        """Parse grid chain from GeoSOT code string (no DB)"""
         code = geosot_code.strip().upper()
         if not is_valid_g0_code(code):
             return {}
@@ -754,25 +701,19 @@ class GeoSotSpatialReasoner:
         return {i + 1: d for i, d in enumerate(body)}
 
     # ------------------------------------------------------------------
-    # BFS 位置定位 / BFS position locating
+    # BFS position locating
     # ------------------------------------------------------------------
 
     def find_position_by_bfs(self, level: int,
                              code: str) -> Tuple[int, int, int, int]:
         """
-        BFS 遍历确定网格在父网格内的行列位置
-        / BFS to locate row/col of a grid within its parent
+        Use BFS to determine a grid node's row and column within its parent. Westward hops give col,
+        southward hops give row, and traversals from the west/southwest boundaries give
+        total_cols/total_rows.
 
-        策略 / Strategy:
-        - 向西 BFS 直到边界 → 跳数 = col / west BFS to boundary → hops = col
-        - 向南 BFS 直到边界 → 跳数 = row / south BFS to boundary → hops = row
-        - 从最西端向东 → total_cols / from westmost eastward → total_cols
-        - 从西南角向北 → total_rows / from SW corner northward → total_rows
-
-        @returns (row, col, total_rows, total_cols)
-                 row=0 南, col=0 西 / row=0 south, col=0 west
+        @returns (row, col, total_rows, total_cols), with row=0 at the south and col=0 at the west.
         """
-        # 向西 → col / west → col
+        # west → col
         col = 0
         cur = code
         while True:
@@ -783,7 +724,7 @@ class GeoSotSpatialReasoner:
             cur = west
         westmost = cur
 
-        # 向南 → row / south → row
+        # south → row
         row = 0
         cur = code
         while True:
@@ -793,7 +734,7 @@ class GeoSotSpatialReasoner:
             row += 1
             cur = south
 
-        # 从最西端向东 → total_cols / westmost eastward → total_cols
+        # westmost eastward → total_cols
         total_cols = 1
         cur = westmost
         while True:
@@ -803,7 +744,7 @@ class GeoSotSpatialReasoner:
             total_cols += 1
             cur = east
 
-        # 从最西端向南找到西南角 / from westmost south to SW corner
+        # from westmost south to SW corner
         southwest = westmost
         cur = westmost
         while True:
@@ -813,7 +754,7 @@ class GeoSotSpatialReasoner:
             southwest = south
             cur = south
 
-        # 从西南角向北 → total_rows / from SW corner north → total_rows
+        # from SW corner north → total_rows
         total_rows = 1
         cur = southwest
         while True:
@@ -826,20 +767,14 @@ class GeoSotSpatialReasoner:
         return row, col, total_rows, total_cols
 
     # ------------------------------------------------------------------
-    # 图结构验证 / Graph structure verification
+    # Graph structure verification
     # ------------------------------------------------------------------
 
     def verify_graph_structure(self) -> Dict:
         """
-        验证 Neo4j 中的 GeoSOT 网格结构
-        / Verify GeoSOT grid structure in Neo4j
-
-        检查项 / Checks:
-        1. 各层级网格节点数量和编码值 / per-level node counts and digit values
-        2. EAST_OF / NORTH_OF 关系数量及正确性 / EAST_OF / NORTH_OF counts and correctness
-        3. GeoSOTCentroidCode 节点和 CC_HAS_LEVEL_k_DIGIT 关系
-           / GeoSOTCentroidCode nodes and CC_HAS_LEVEL_k_DIGIT relations
-        4. 抽样 BFS 验证 / sample BFS checks
+        Verify the Neo4j GeoSOT structure: per-level node counts/codes, EAST_OF/NORTH_OF counts and
+        direction correctness, CC nodes and CC_HAS_LEVEL_k_DIGIT affiliations, and sampled BFS
+        traversals.
         """
         report: Dict = {"levels": {}, "geosot_codes": {}, "issues": []}
 
@@ -847,7 +782,7 @@ class GeoSotSpatialReasoner:
         print("GeoSOT 知识图谱网格结构验证")
         print("=" * 72)
 
-        # ---- 1. 各层级网格节点和关系 / per-level grid nodes and relations ----
+        # ---- 1. Grid nodes and relations at each level ----
         print(f"\n{'层级':<6} {'节点数':<8} {'EAST_OF':<10} "
               f"{'NORTH_OF':<10} {'编码值':<16} {'状态'}")
         print("-" * 66)
@@ -882,7 +817,7 @@ class GeoSotSpatialReasoner:
                 if north_count != 2:
                     issues.append(f"NORTH_OF 期望 2, 实际 {north_count}")
 
-                # 验证具体关系对 / verify concrete relation pairs
+                # verify concrete relation pairs
                 east_pairs = set()
                 for r in self._run(
                     f"MATCH (a:`{label}`)-[:EAST_OF]->(b:`{label}`) "
@@ -924,7 +859,7 @@ class GeoSotSpatialReasoner:
                 "is_template": is_template, "issues": issues,
             }
 
-        # ---- 2. GeoSOTCentroidCode 节点 / GeoSOTCentroidCode nodes ----
+        # ---- 2. GeoSOTCentroidCode nodes ----
         print(f"\n{'='*40}")
         print("GeoSOTCentroidCode 节点统计")
         print(f"{'='*40}")
@@ -949,7 +884,7 @@ class GeoSotSpatialReasoner:
             print(f"  样例: {sample_codes}")
             report["geosot_codes"]["samples"] = sample_codes
 
-        # ---- 3. BFS 抽样验证 / BFS sample verification ----
+        # ---- 3. Sampled BFS validation ----
         if levels_with_nodes:
             print(f"\n{'='*40}")
             print("BFS 抽样验证")
@@ -968,7 +903,7 @@ class GeoSotSpatialReasoner:
                     report["issues"].append(
                         f"L{test_level} BFS 码元'{digit}' 位置不匹配")
 
-        # ---- 总结 / summary ----
+        # ---- Summary ----
         print(f"\n{'='*72}")
         if report["issues"]:
             print(f"发现 {len(report['issues'])} 个问题:")
@@ -982,13 +917,13 @@ class GeoSotSpatialReasoner:
         return report
 
     # ------------------------------------------------------------------
-    # 主推理方法 / Main reasoning methods
+    # Main reasoning methods
     # ------------------------------------------------------------------
 
     def find_first_different_level(
         self, chain_a: Dict[int, str], chain_b: Dict[int, str],
     ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-        """找到首个分异层级 / Find first differing level"""
+        """Find first differing level"""
         all_levels = sorted(set(chain_a.keys()) | set(chain_b.keys()))
         for lvl in all_levels:
             da, db = chain_a.get(lvl), chain_b.get(lvl)
@@ -1006,18 +941,10 @@ class GeoSotSpatialReasoner:
         compare_postgis: bool = True,
     ) -> Dict:
         """
-        计算两个 GeoSOT 编码之间的距离和相对方向
-        / Compute distance and relative direction between two GeoSOT codes
-
-        算法流程 / Pipeline:
-        1. 获取网格链（优先 Neo4j，回退到编码解析）
-           / Get grid chains (Neo4j first, code parse fallback)
-        2. 逐级比较找首个分异层级 / Find first differing level
-        3. BFS 遍历计算各级偏移 / BFS for per-level offsets
-        4. 累加偏移，解码参考坐标，估计两点坐标
-           / Accumulate offsets; decode reference; estimate both points
-        5. Vincenty 距离 + 方向 / Vincenty distance + direction
-        6. 可选：与直接解码结果对比 / Optional: compare with direct decode
+        Compute distance and relative direction between two GeoSOT codes. Obtain grid chains from
+        Neo4j or parse the codes as fallback; find the differing level, accumulate BFS offsets,
+        reconstruct positions from the common reference, and calculate Vincenty distance/bearing.
+        Optionally compare with direct grid decoding.
         """
         code_a = code_a.strip().upper()
         code_b = code_b.strip().upper()
@@ -1044,7 +971,7 @@ class GeoSotSpatialReasoner:
 
         t_total = time.perf_counter()
 
-        # ---- 1. 获取网格链 / get grid chains ----
+        # ---- 1. Obtain the grid chains ----
         t0 = time.perf_counter()
         chain_a_data = self.get_grid_chain_from_neo4j(code_a)
         chain_b_data = self.get_grid_chain_from_neo4j(code_b)
@@ -1082,7 +1009,7 @@ class GeoSotSpatialReasoner:
                 f"[推理] B 网格链({source_b}, {len(chain_b_data)}层): "
                 f"{cb_show}{suffix_b}")
 
-        # ---- 2. 找首个分异层级 / find first differing level ----
+        # ---- 2. Find the first differing level ----
         t0 = time.perf_counter()
         diff_level, da, db = self.find_first_different_level(
             chain_a_data, chain_b_data)
@@ -1103,7 +1030,7 @@ class GeoSotSpatialReasoner:
                 f"[推理] 首个分异层级: L{diff_level}, "
                 f"A='{da}', B='{db}'")
 
-        # ---- 3. 逐级计算偏移量 / per-level offset accumulation ----
+        # ---- 3. Accumulate offsets by level ----
         t0 = time.perf_counter()
         total_ew = 0.0
         total_ns = 0.0
@@ -1150,7 +1077,7 @@ class GeoSotSpatialReasoner:
                         f" -> 相同")
 
             else:
-                # BFS 定位 / BFS locate
+                # BFS locate
                 r_a, c_a, tr_a, tc_a = self.find_position_by_bfs(
                     level, digit_a)
                 r_b, c_b, tr_b, tc_b = self.find_position_by_bfs(
@@ -1209,7 +1136,7 @@ class GeoSotSpatialReasoner:
                 f"\n[推理] 总偏移: EW={total_ew:+.10f} 度, "
                 f"NS={total_ns:+.10f} 度")
 
-        # ---- 4. 计算距离 / compute distance ----
+        # ---- 4. Compute distance ----
         t0 = time.perf_counter()
         common_parent_level = max(diff_level - 1, 1)
         parent_code = reconstruct_code(chain_a_data, common_parent_level)
@@ -1218,7 +1145,7 @@ class GeoSotSpatialReasoner:
         result["common_parent_level"] = common_parent_level
         result["reference_point"] = {"lon": ref_lon, "lat": ref_lat}
 
-        # 各点从共同父网格中心的累计偏移 / cumulative offsets from common parent center
+        # cumulative offsets from common parent center
         off_a_ew, off_a_ns = 0.0, 0.0
         off_b_ew, off_b_ns = 0.0, 0.0
         for level in range(diff_level, max_level + 1):
@@ -1262,7 +1189,7 @@ class GeoSotSpatialReasoner:
                 f"[推理] Vincenty 距离: {dist_km:.6f} km "
                 f"({dist_km * 1000:.2f} m)")
 
-        # ---- 5. 方向 / direction ----
+        # ---- 5. Compute direction ----
         t0 = time.perf_counter()
         result["direction"] = self._compute_direction(total_ew, total_ns)
         result["timing"]["direction_ms"] = (
@@ -1273,11 +1200,11 @@ class GeoSotSpatialReasoner:
         result["timing"]["total_ms"] = (
             time.perf_counter() - t_total) * 1000
 
-        # ---- 6. 对比直接解码 / compare with direct decode ----
+        # ---- 6. Compare with direct decoding ----
         if compare_decode:
             self._add_decode_comparison(result, code_a, code_b)
 
-        # ---- 7. 对比 PostGIS 实际坐标（精度基准） / compare PostGIS real coords (baseline) ----
+        # ---- 7. Compare with PostGIS coordinates as the accuracy reference ----
         if compare_postgis and self._pg_conn is not None:
             self._add_postgis_comparison(result, code_a, code_b)
 
@@ -1308,7 +1235,7 @@ class GeoSotSpatialReasoner:
 
     def _add_decode_comparison(self, result: Dict,
                                code_a: str, code_b: str):
-        """对比直接解码坐标的结果 / Compare against direct-decoded coordinates"""
+        """Compare against direct-decoded coordinates"""
         try:
             center_a = code_to_center(code_a)
             center_b = code_to_center(code_b)
@@ -1384,7 +1311,7 @@ class GeoSotSpatialReasoner:
 
     def _add_postgis_comparison(self, result: Dict,
                                 code_a: str, code_b: str):
-        """对比 PostGIS 中实际要素坐标（精度基准） / Compare against PostGIS real feature coords (baseline)"""
+        """Compare against PostGIS real feature coords (baseline)"""
         try:
             t0 = time.perf_counter()
             coord_a = self._query_postgis_coordinates(code_a)
@@ -1417,7 +1344,7 @@ class GeoSotSpatialReasoner:
             graph_ew = result["ew_offset_deg"]
             graph_ns = result["ns_offset_deg"]
 
-            # 推理距离 vs PostGIS 距离 / reasoned distance vs PostGIS
+            # reasoned distance vs PostGIS
             if pg_dist_m is not None:
                 postgis_dist_m = pg_dist_m
             else:
@@ -1436,7 +1363,7 @@ class GeoSotSpatialReasoner:
                 (ew_err * 111000 * cos_lat) ** 2
                 + (ns_err * 111000) ** 2)
 
-            # 估计坐标 vs 实际坐标 / estimated coords vs real
+            # estimated coords vs real
             est_a = result.get("estimated_a", {})
             est_b = result.get("estimated_b", {})
             coord_err_a_m = None
@@ -1454,7 +1381,7 @@ class GeoSotSpatialReasoner:
                     (d_b_lon * 111000 * cos_lat_b) ** 2
                     + (d_b_lat * 111000) ** 2)
 
-            # 解码坐标 vs 实际坐标 / decoded coords vs real
+            # decoded coords vs real
             decode_err_a_m = None
             decode_err_b_m = None
             decode_comp = result.get("decode_comparison")
@@ -1547,11 +1474,11 @@ class GeoSotSpatialReasoner:
                 self._print(f"[警告] PostGIS 对比失败: {e}")
 
     # ------------------------------------------------------------------
-    # 格式化输出 / Formatted output
+    # Formatted output
     # ------------------------------------------------------------------
 
     def format_result(self, result: Dict) -> str:
-        """格式化推理结果 / Format reasoning result"""
+        """Format reasoning result"""
         lines = [
             "=" * 70,
             "GeoSOT 空间推理结果",
@@ -1568,7 +1495,7 @@ class GeoSotSpatialReasoner:
         lines.append(f"首个分异层级: L{result['different_level']}")
         lines.append("")
 
-        # 逐级偏移 / per-level offsets
+        # per-level offsets
         details = result.get("level_details", [])
         differing = [d for d in details if d["method"] not in
                      ("相同", "数据缺失", "")]
@@ -1587,7 +1514,7 @@ class GeoSotSpatialReasoner:
                     f"  {d['method']}")
             lines.append("")
 
-        # 汇总 / summary
+        # summary
         lines.append("汇总:")
         lines.append(
             f"  总偏移: EW={result['ew_offset_deg']:+.10f} 度, "
@@ -1653,7 +1580,7 @@ class GeoSotSpatialReasoner:
 
 
 # ============================================================================
-# 命令行入口 / CLI entry
+# CLI entry
 # ============================================================================
 
 def main():
@@ -1686,7 +1613,7 @@ def main():
         reasoner.close()
         return
 
-    # 交互模式 / interactive mode
+    # interactive mode
     print("\nGeoSOT 空间推理 - 交互模式")
     print("输入两个 GeoSOT 编码（空格分隔），计算距离和方向")
     print("输入 'verify' 验证图结构, 'q' 退出")

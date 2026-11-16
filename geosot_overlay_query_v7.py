@@ -1,59 +1,25 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-GeoSOT 叠置查询 V7 — 多分辨率多边形网格填充 (全链路离散网格空间)
-GeoSOT overlay query V7 — multi-resolution polygon grid fill (end-to-end discrete grid space)
+Forward overlay V7 using multiresolution polygon filling in discrete grid space.
 
-将正向叠置查询完全转化为离散网格上的集合运算, 彻底消除 PIP 步骤。
-全流程无需将编码解码回经纬度：
-Turn forward overlay fully into set ops on a discrete grid, eliminating the PIP step.
-The whole pipeline never decodes codes back to lon/lat:
-  折点编码 → (x,y) 整数网格 → 多分辨率网格填充 → 多级前缀集
-  → 知识图谱 STARTS WITH 匹配 → 直接结果
-  vertex codes → (x,y) integer grid → multi-res fill → multi-level prefixes
-  → knowledge-graph STARTS WITH → direct results
+Map vertex codes to centered integer (x,y), choose a target level and covering rectangle,
+rasterize/classify cells with BFS subdivision, and query candidate codes by prefixes. Inside
+prefixes yield direct hits; boundary prefixes require integer winding-number PIP. Thus the
+current implementation retains boundary verification rather than eliminating PIP entirely.
+No geographic-coordinate decoding is needed in the grid path.
 
-与 V5/V6 的区别 / vs V5/V6:
-  - V5: bbox 前缀 → 候选 → 浮点 PIP
-  - V5: bbox prefixes → candidates → float PIP
-  - V6: bbox 前缀 → 候选 → 整数掩膜 PIP
-  - V6: bbox prefixes → candidates → integer-mask PIP
-  - V7: 多分辨率网格填充 → 多级前缀 → 直接匹配 (无 PIP)
-  - V7: multi-res fill → multi-level prefixes → direct match (no PIP)
+V5 used bbox prefixes and floating-point PIP; V6 used a grid-mask PIP; V7 separates inside
+and boundary prefixes. Winding predicates use int64 cross-product signs without floating-
+point division, matching the geometry module's cross-product primitive. Short codes map to
+cell centers to avoid zero-fill corner bias.
 
-  V7 流程 / V7 flow:
-           ① 读取折点编码 → (x,y) 整数网格坐标
-           ① Read vertex codes → (x,y) integer grid
-           ② 确定目标层级 + 覆盖矩形
-           ② Choose target level + cover rectangle
-           ③ 多分辨率网格填充 (掩膜栅格化 + BFS)
-             - inside 单元 → 直接输出前缀 → 图匹配即命中
-             - boundary 单元 → 输出前缀 → 图匹配后做整数 PIP 精筛
-           ③ Multi-res fill (mask rasterize + BFS)
-             - inside cells → emit prefixes → graph match = hit
-             - boundary cells → emit prefixes → graph match then integer PIP refine
-           ④ 知识图谱 STARTS WITH 批量匹配
-           ④ Knowledge-graph STARTS WITH batch match
-           ⑤ 边界候选再整数 PIP (仅在网格空间, 无经纬度参与)
-           ⑤ Boundary candidates get integer PIP (grid space only; no lon/lat)
-
-特性 / Features:
-  - 全链路离散网格: 编码 → 整数网格 → 掩膜填充 → 图匹配
-  - End-to-end discrete grid: codes → int grid → mask fill → graph match
-  - inside 前缀直接命中, boundary 前缀经整数精筛
-  - inside prefixes hit directly; boundary prefixes need integer refine
-  - 整数网格 PIP 也使用 int64 叉积, 无浮点误差
-  - Integer-grid PIP uses int64 cross products; no float error
-  - 与 geosot_geometry_reasoning._cross 同一数学原理
-  - Same math as geosot_geometry_reasoning._cross
-  - 编码不足 32 位时居中映射, 避免系统性偏移差
-  - Short codes use centered mapping to avoid systematic offset
-  - 填充策略与 KNN V2 的 circle_fill 一致: 多分辨率四叉树
-  - Fill strategy matches KNN V2 circle_fill: multi-res quadtree
-
-使用方法 / Usage:
+Usage:
     python geosot_overlay_query_v7.py --code G0xxx --source POI
-    python geosot_overlay_query_v7.py --batch 50 --source POI
+    python geosot_overlay_query_v7.py --batch 50 --source POI --seed 42
+    python geosot_overlay_query_v7.py --all --source POI --output result.csv
+    python geosot_overlay_query_v7.py --all --source POI --max-cells 256
+    python geosot_overlay_query_v7.py --all --source POI --refine 4
 """
 
 import csv
@@ -99,25 +65,19 @@ GRID_LEVEL = 32
 
 
 # ============================================================================
-# Z-order (Morton code) 位运算 / Z-order (Morton code) bit operations
+# Z-order (Morton code) bit operations
 # ============================================================================
 
 @lru_cache(maxsize=500_000)
 def _code_to_xy(code: str, level: int) -> Tuple[int, int]:
     """
-    GeoSOT 编码 → (x, y) 整数网格坐标 (Z-order 解码, 居中映射)。
-    GeoSOT code → (x, y) integer grid coords (Z-order decode, centered mapping).
+    Map a GeoSOT code to centered integer Z-order coordinates. Split each digit d into x_bit=d&1
+    and y_bit=(d>>1)&1, then concatenate bits. If the code is shorter than level, shift and add
+    the cell-center offset rather than mapping to the lower-left corner.
 
-    每个四进制数字 d ∈ {0,1,2,3} 拆为:
-    Each base-4 digit d ∈ {0,1,2,3} splits as:
-      x_bit = d & 1,  y_bit = (d >> 1) & 1
-    按位拼接到 x, y 整数坐标。
-    Bits are concatenated into integer x, y.
-
-    编码不足 level 位时, 先按实际长度解码, 再加居中半格偏移,
-    避免映射到单元西南角带来的系统性偏差。
-    When code length < level, decode at actual length then add a half-cell center
-    offset to avoid systematic SW-corner bias.
+    @param code GeoSOT code, for example G00113022131.
+    @param level Target level.
+    @returns Centered (x, y) integer coordinates.
     """
     body = code[1:]
     code_len = len(body)
@@ -136,13 +96,12 @@ def _code_to_xy(code: str, level: int) -> Tuple[int, int]:
 
 def _xy_to_code(x: int, y: int, level: int) -> str:
     """
-    (x, y) 整数网格坐标 → GeoSOT 编码 (Z-order 编码)。
-    (x, y) integer grid coords → GeoSOT code (Z-order encode).
+    Encode integer (x, y) grid coordinates as a GeoSOT Z-order code.
 
-    @param x x 坐标 / x coordinate
-    @param y y 坐标 / y coordinate
-    @param level 层级 / level
-    @param hemisphere 半球字符 / hemisphere char
+    @param x Grid x coordinate.
+    @param y Grid y coordinate.
+    @param level Encoding level.
+    @returns GeoSOT code.
     """
     digits = []
     for i in range(level - 1, -1, -1):
@@ -154,15 +113,11 @@ def _xy_to_code(x: int, y: int, level: int) -> str:
 
 def _codes_to_xy_batch(codes: List[str], level: int) -> np.ndarray:
     """
-    批量 GeoSOT 编码 → (x, y), 居中映射。
-    Batch GeoSOT codes → (x, y), centered mapping.
+    Vectorize centered GeoSOT-to-(x,y) decoding, matching _code_to_xy for short codes.
 
-    编码不足 level 位时加居中偏移, 与 _code_to_xy 一致。
-    Short codes get center offset, same as _code_to_xy.
-
-    @param codes GeoSOT 编码列表 / list of GeoSOT codes
-    @param level 目标层级 / target level
-    @returns (N, 2) int64 数组 / (N, 2) int64 array
+    @param codes GeoSOT codes.
+    @param level Target level.
+    @returns (N, 2) int64 array.
     """
     n = len(codes)
     if n == 0:
@@ -199,7 +154,7 @@ def _codes_to_xy_batch(codes: List[str], level: int) -> np.ndarray:
 
 
 # ============================================================================
-# 目标层级确定 + 覆盖矩形 (纯整数运算) / Target level + cover rectangle (pure integer ops)
+# Target level + cover rectangle (pure integer ops)
 # ============================================================================
 
 def _lcp_of(codes: List[str]) -> str:
@@ -221,16 +176,15 @@ def _determine_target_level(
     max_cells: int = 256,
 ) -> Tuple[int, Tuple[int, int, int, int]]:
     """
-    从折点的网格坐标确定目标层级 + 覆盖矩形。
+    Choose a target level and covering rectangle from full-depth vertex coordinates. Starting at
+    the LCP level, refine while the vertex bounding rectangle fits within max_cells; choose the
+    finest admissible level.
 
-    从 LCP 级别开始逐层钻取, 每层计算折点在网格坐标系下的
-    边界矩形面积, 选择最细的层级使面积 <= max_cells。
-
-    @param vertex_xy_full 折点在 max_depth 级别的 (x, y) 列表
-    @param lcp_level LCP 层级 (body 长度)
-    @param max_depth 最大可用深度
-    @param max_cells 覆盖矩形最大单元数
-    @returns (target_level, (x_min, x_max, y_min, y_max))
+    @param vertex_xy_full Vertex (x,y) coordinates at max_depth.
+    @param lcp_level LCP body length.
+    @param max_depth Maximum depth.
+    @param max_cells Maximum covering rectangle cell count.
+    @returns (target_level, (x_min, x_max, y_min, y_max)).
     """
     best_level = lcp_level
     best_rect = (0, 0, 0, 0)
@@ -260,15 +214,9 @@ def _rect_to_min_prefixes(
     lcp: str,
 ) -> List[str]:
     """
-    覆盖矩形 → 最小四叉前缀集 (DFS 生成, 无需枚举后合并)。
-    Cover rectangle → minimal quadtree prefix set (DFS; no enumerate-then-merge).
-
-    从 LCP 节点开始递归:
-    Recurse from the LCP node:
-      - 当前节点完全落在矩形内 → 直接输出此前缀
-      - fully inside rectangle → emit this prefix
-      - 部分相交 → 四分后继续
-      - partial overlap → subdivide and continue
+    Generate a minimal quadtree prefix cover for a rectangle by DFS from its LCP node. Emit
+    fully contained cells, recurse into four children for partial overlap, and prune disjoint
+    cells; no post-enumeration merge is needed.
     """
     lcp_lv = max(len(lcp) - 1, 0)
     lcp_x, lcp_y = _code_to_xy(lcp, lcp_lv) if lcp_lv > 0 else (0, 0)
@@ -307,7 +255,7 @@ def _rect_to_min_prefixes(
 
 
 # ============================================================================
-# 内包最大网格层级 L 计算 + 平铺覆盖 (mbr_cover_pip 路径专用) / Max inscribed cell level L + tiled cover (mbr_cover_pip path only)
+# Max inscribed cell level L + tiled cover (mbr_cover_pip path only)
 # ============================================================================
 
 def _compute_inscribed_grid_level(
@@ -318,12 +266,19 @@ def _compute_inscribed_grid_level(
     verify_corners: bool = True,
 ) -> int:
     """
-    估计 "多边形能完整内包的最大网格" 所在层级 L。
-    Estimate level L of the largest grid cell fully inscribed in the polygon.
+    Estimate the coarsest useful level of a cell that fits inside the polygon.
 
-    @param polygon_xy 多边形折点的 (x, y) 整数坐标 (max_depth 层级下)
-                      / polygon vertex (x,y) ints at max_depth
-    @param max_depth 最大深度 / max depth
+    Use the shorter MBR side d_min as the cell-size upper bound: L=max_depth-floor(log2(d_min));
+    constrain L by lcp_level and refine by safety_shrink. If verify_corners is enabled,
+    enumerate aligned cells and test all four corners, increasing L until an interior cell is
+    found.
+
+    @param polygon_xy Full-depth integer polygon vertices.
+    @param lcp_level Lower bound on L.
+    @param max_depth Maximum available level.
+    @param safety_shrink Extra refinement levels.
+    @param verify_corners Whether to verify an interior cell.
+    @returns Selected level L.
     """
     x_min = int(polygon_xy[:, 0].min())
     x_max = int(polygon_xy[:, 0].max())
@@ -384,7 +339,7 @@ def _rect_at_level(
     target_level: int,
     max_depth: int,
 ) -> Tuple[int, int, int, int]:
-    """把 polygon MBR 折射到 target_level 网格坐标系下的整数矩形。 / Project polygon MBR into an integer rectangle at target_level."""
+    """Project polygon MBR into an integer rectangle at target_level."""
     shift = max_depth - target_level
     if shift > 0:
         xs = polygon_xy[:, 0] >> shift
@@ -397,7 +352,7 @@ def _rect_at_level(
 
 
 # ============================================================================
-# 多分辨率多边形网格填充 / Multi-resolution polygon grid fill
+# Multi-resolution polygon grid fill
 # ============================================================================
 
 REFINE_LEVELS = 0
@@ -421,14 +376,11 @@ def _polygon_fill(
     refine_levels: int = REFINE_LEVELS,
 ) -> Tuple[List[str], List[str], int, int, int]:
     """
-    多分辨率多边形网格填充: BFS 四叉树细分。
+    Multiresolution polygon filling through BFS quadtree subdivision. Return inside and boundary
+    prefixes separately so only boundary candidates need PIP verification. Rasterize at
+    finest_fill_lv+MASK_EXTRA_LEVELS, usually far below max_depth, to reduce rasterization cost.
 
-    返回 inside 和 boundary 前缀分开, 便于后续对 boundary 做 PIP 精筛。
-    掩膜分辨率 = finest_fill_lv + MASK_EXTRA_LEVELS (远小于 max_depth),
-    足以精确分类 inside/boundary, 同时极大减小光栅化开销。
-
-    @returns (inside_prefixes, boundary_prefixes, n_inside, n_boundary,
-             n_levels_used)
+    @returns (inside_prefixes, boundary_prefixes, n_inside, n_boundary, n_levels_used).
     """
     finest_fill_lv = min(target_lv + refine_levels, max_depth)
     actual_refine = finest_fill_lv - target_lv
@@ -509,10 +461,10 @@ def _polygon_fill(
                                and mx_e <= mk_w and my_e <= mk_h)
             cell_area = cell_size * cell_size
 
-            # 严格三分类: / Strict three-way classification:
-            # 1) outside: 区域掩膜和为 0 / 1) outside: region mask sum is 0
-            # 2) inside: 完整落在掩膜内且像素和=cell_area / 2) inside: fully inside mask and pixel sum == cell_area
-            # 3) boundary: 其余与边界相交/不确定单元 / 3) boundary: remaining cells intersecting/uncertain on the border
+            # Strict three-way classification:
+            # 1) outside: region mask sum is 0
+            # 2) inside: fully inside mask and pixel sum == cell_area
+            # 3) boundary: remaining cells intersecting/uncertain on the border
             if region_sum == 0:
                 continue
             if fully_in_bounds and region_sum == cell_area:
@@ -532,7 +484,7 @@ def _polygon_fill(
 
 
 # ============================================================================
-# 整数网格 PIP — 绕数法 (Winding Number), 纯整数叉积 + 邻域边缘补偿 / Integer-grid PIP — winding number; pure integer cross products + neighborhood edge compensation
+# Integer-grid PIP — winding number; pure integer cross products + neighborhood edge compensation
 # ============================================================================
 
 NEIGHBOR_PIP = NEIGHBOR_PIP_DEFAULT
@@ -560,12 +512,13 @@ def _winding_number_batch(
     polygon_xy: np.ndarray,
 ) -> np.ndarray:
     """
-    严格绕数法 PIP, 全链路整数运算, NumPy 向量化。
-    Strict winding-number PIP; all-integer; NumPy vectorized.
+    Vectorized integer winding-number PIP using the same cross-product primitive as the geometry
+    module: cross(O,A,B)=(A.x-O.x)*(B.y-O.y)-(B.x-O.x)*(A.y-O.y). Use int64
+    products/subtraction, without floating-point division or geographic decoding.
 
-    数学原语与 geosot_geometry_reasoning._cross 一致:
-    Same math primitive as geosot_geometry_reasoning._cross:
-      cross(O,A,B) = (A-O)×(B-O)
+    @param pts_xy (M,2) int64 candidate coordinates.
+    @param polygon_xy (N,2) int64 polygon vertices.
+    @returns (M,) boolean mask.
     """
     n_pts = len(pts_xy)
     n_poly = len(polygon_xy)
@@ -605,15 +558,18 @@ def _pip_winding_batch(
     edge_eps: float = 0.0,
 ) -> np.ndarray:
     """
-    绕数法 PIP + 邻域边缘补偿, 全链路整数运算。
-    Winding PIP + neighborhood edge compensation; all-integer.
+    Integer winding-number PIP with four-neighbor boundary compensation. First classify points
+    by strict winding number. For winding-zero candidates, test the four adjacent integer
+    positions; a nonzero neighbor classifies the candidate as boundary-inclusive.
 
-    第一阶段: 严格绕数法, 叉积符号累加判定内部。
-    Phase 1: strict winding; accumulate cross-product signs for inside.
-    第二阶段: 对绕数为 0 (严格外部) 的候选点, 检查其 4-邻域
-    是否有点落在边上/内部, 作为边界放宽。
-    Phase 2: for winding==0 (strict outside), check 4-neighborhood for
-    on-edge/inside as border relaxation.
+    Vertex snapping by about half a grid cell can displace the discrete boundary by up to one
+    cell. This check acts as a one-cell Minkowski dilation intended to approximate boundary-
+    inclusive ST_Intersects semantics. It remains a discrete compensation rule, not a general
+    equivalence proof.
+
+    @param pts_xy (M,2) int64 candidates.
+    @param polygon_xy (N,2) int64 vertices.
+    @returns (M,) boolean mask.
     """
     result = _winding_number_batch(pts_xy, polygon_xy)
 
@@ -684,11 +640,11 @@ def _edge_eps_for_level(target_level: int) -> float:
 
 
 # ============================================================================
-# 线性整数 PIP 空间 (修复 DMS 位打包导致的非线性 PIP) / Linear integer PIP space (fixes nonlinear PIP from DMS bit-packing)
+# Linear integer PIP space (fixes nonlinear PIP from DMS bit-packing)
 # ----------------------------------------------------------------------------
-# 1 单位 = 1 / (3600 * 2048) 度  ≈ 1.5 cm @ 赤道
-# 1 度 = 7,372,800 单位; 1 分 = 122,880 单位; 1 秒 = 2,048 单位 / 1 degree = 7,372,800 units; 1 minute = 122,880 units; 1 second = 2,048 units
-# 此空间是欧式可加, 跨度/分/秒边界没有 DMS 跳跃, 绕数法叉积几何成立。 / This space is Euclidean-additive; no DMS jumps at deg/min/sec borders; winding cross products are valid.
+# One unit = 1/(3600*2048) degree, approximately 1.5 cm at the equator.
+# 1 degree = 7,372,800 units; 1 minute = 122,880 units; 1 second = 2,048 units
+# This space is Euclidean-additive; no DMS jumps at deg/min/sec borders; winding cross products are valid.
 # ============================================================================
 
 _DEG_TO_LIN = 7_372_800
@@ -697,12 +653,11 @@ _SEC_TO_LIN = 2_048
 
 
 def _dms31_to_linear31_int(v: int) -> int:
-    """单值 DMS 位打包 (31 位) -> 线性整数。
-Single DMS bit-packed value (31-bit) → linear integer.
+    """
+    Convert one 31-bit packed DMS value into a linear integer coordinate.
 
-    @param v 31 位 DMS 位打包整数 (即 _code_to_xy 输出的低 31 位)
-             / 31-bit DMS packed int (low 31 bits of _code_to_xy)
-    @returns 同一空间下的线性整数 / linear integer in the same space
+    @param v Packed value, using the low 31 bits of _code_to_xy output.
+    @returns The same physical position in linear integer space.
     """
     v = v & 0x7FFFFFFF
     deg = (v >> 23) & 0xFF
@@ -717,13 +672,14 @@ Single DMS bit-packed value (31-bit) → linear integer.
 
 def _xy_dms_to_linear(xy: np.ndarray) -> np.ndarray:
     """
-    DMS 位打包 (x, y) -> 线性 (x_lin, y_lin), 向量化。
-    DMS bit-packed (x, y) → linear (x_lin, y_lin), vectorized.
+    Vectorize conversion from packed DMS (x,y) to linear integer coordinates. Packed
+    minute/second fields contain nonlinear gaps of 8192/491520 units, which can invalidate
+    Euclidean cross-product tests across DMS boundaries. Decompose
+    degree/minute/second/subsecond fields and recombine them in a continuous integer space,
+    approximately 1.5 cm per unit at the equator, without floating-point operations.
 
-    GeoSOT GBT40087 整数空间在跨度/分/秒边界处有 8192/491520 等空洞,
-    直接做绕数叉积会扭曲; 本函数解开位打包到线性可加空间。
-    GeoSOT GBT40087 integer space has holes at deg/min/sec borders (8192/491520...);
-    raw winding cross products warp; this unpacks to a linear additive space.
+    @param xy (N,2) int64 _code_to_xy output with zero MSB.
+    @returns (N,2) int64 linear coordinates.
     """
     arr = np.asarray(xy, dtype=np.int64)
     if arr.size == 0:
@@ -756,11 +712,12 @@ def _xy_dms_to_linear(xy: np.ndarray) -> np.ndarray:
 
 def _lonlat_to_xy32(lon: float, lat: float) -> Tuple[int, int]:
     """
-    经度/纬度 -> 线性整数空间 (与 _xy_dms_to_linear 同坐标系)。
-    Lon/lat → linear integer space (same frame as _xy_dms_to_linear).
+    Convert northeastern-hemisphere lon/lat to the linear integer space used by
+    _xy_dms_to_linear and winding PIP. One unit is 1/(3600*2048) degree. PostGIS rings and
+    decoded vertex codes then share one additive integer coordinate space without DMS-boundary
+    jumps.
 
-    1 单位 = 1 / (3600 * 2048) 度。这是绕数法 PIP 实际使用的几何空间。
-    1 unit = 1/(3600*2048) degrees. This is the geometry space winding PIP uses.
+    @returns Integer (x_lin, y_lin), for nonnegative lon/lat.
     """
     try:
         lon = float(lon)
@@ -785,9 +742,9 @@ def _fetch_polygon_rings_xy_from_postgis(
     main_code: str,
 ) -> List[Tuple[np.ndarray, List[np.ndarray]]]:
     """
-    从 PostGIS 读取多边形外环/内环并转为整数网格坐标。
+    Read exterior/interior polygon rings from PostGIS and convert them to integer coordinates.
 
-    @returns [(outer_xy, [hole_xy...]), ...]
+    @returns [(outer_xy, [hole_xy, ...]), ...].
     """
     key = (table, main_code.strip().upper())
     if key in _ring_cache:
@@ -872,10 +829,7 @@ def _postgis_filter_candidates(
     target_table: str,
     candidates: List[str],
 ) -> Tuple[Set[str], float]:
-    """
-    用 PostGIS ST_Intersects 对候选做最终过滤。
-    Final candidate filter via PostGIS ST_Intersects.
-    """
+    """Apply final candidate filtering with PostGIS ST_Intersects."""
     if (not pg_conn) or (not query_table) or (not target_table) or (not candidates):
         return set(candidates), 0.0
 
@@ -906,14 +860,11 @@ def _strict_geosot_filter_candidates(
     polygon_xy: np.ndarray,
 ) -> Tuple[Set[str], float]:
     """
-    纯 GeoSOT 严格二次过滤:
-    Pure GeoSOT strict secondary filter:
-      - 仅用严格绕数法 (_winding_number_batch)
-      - strict winding only (_winding_number_batch)
-      - 不使用邻域补偿, 不使用边界容差
-      - no neighborhood compensation, no border tolerance
-      - PIP 空间为线性整数 (与多边形同坐标系)
-      - PIP space is linear integers (same frame as the polygon)
+    Strict GeoSOT secondary filtering: use _winding_number_batch without neighbor compensation
+    or boundary tolerance. Convert packed DMS vertices to linear integer space to avoid DMS-
+    boundary discontinuities.
+
+    @param polygon_xy Packed DMS polygon vertices; converted internally.
     """
     if not candidates:
         return set(), 0.0
@@ -934,8 +885,8 @@ def _pip_winding_with_holes(
     edge_eps_outer: float = 0.0,
 ) -> np.ndarray:
     """
-    多环判定: 点在任一外环内，且不在对应任何内环内。
-    Multi-ring test: inside any outer ring and not inside any corresponding hole.
+    A point is inside a multipart polygon when it is inside an exterior ring and outside that
+    component's holes.
     """
     n = len(pts_xy)
     if n == 0:
@@ -951,7 +902,7 @@ def _pip_winding_with_holes(
         if holes_xy:
             in_hole = np.zeros(n, dtype=bool)
             for hxy in holes_xy:
-                # 洞采用严格判定, 不做边界放宽 / Holes use a strict test; no border relaxation
+                # Holes use a strict test; no border relaxation
                 in_hole |= _pip_winding_batch(pts_xy, hxy, edge_eps=0.0)
             in_poly = in_outer & (~in_hole)
         else:
@@ -966,14 +917,13 @@ def _decide_use_fast_path(
     n_cover: int,
 ) -> Tuple[bool, bool]:
     """
-    决定是否走快速路径。
-    Decide whether to take the fast path.
+    Choose the fast path. A valid LCP at least FAST_PATH_LCP_LEVEL always qualifies; otherwise
+    LOW_LCP_ALLOW_SMALL_COVER_FASTPATH controls the small-cover alternative.
 
-    规则 / Rules:
-      1) LCP>=FAST_PATH_LCP_LEVEL 且 LCP 存在: 始终快速路径
-         / LCP>=FAST_PATH_LCP_LEVEL and LCP exists: always fast path
-      2) 否则是否允许 "小覆盖快速路径" 取决于覆盖矩形前缀数
-         / else small-cover fast path depends on cover-rect prefix count
+    @param lcp_lv LCP level.
+    @param has_lcp Whether an LCP exists.
+    @param n_cover Minimal prefix cover size.
+    @returns (use_fast_path_lcp, use_fast_path).
     """
     use_fast_path_lcp = (lcp_lv >= FAST_PATH_LCP_LEVEL) and has_lcp
     use_fast_path_small_cover = (
@@ -984,15 +934,13 @@ def _decide_use_fast_path(
 
 
 # ============================================================================
-# POI Grid Cache — 纯整数, 不存储 lonlat / POI Grid Cache — pure integers; no lon/lat stored
+# POI Grid Cache — pure integers; no lon/lat stored
 # ============================================================================
 
 class POIGridCacheV6:
     """
-    预加载所有 POI 为 32 级 (x, y) 整数网格坐标。
-    Preload all POIs as level-32 (x, y) integer grid coordinates.
-    不解码经纬度, 仅做编码→位运算→整数坐标。
-    No lon/lat decode; only code → bit ops → integer coords.
+    Preload POIs as level-32 integer (x,y) coordinates using bit operations on codes, without
+    geographic decoding.
     """
 
     def __init__(self):
@@ -1009,10 +957,12 @@ class POIGridCacheV6:
         verbose: bool = True,
     ) -> int:
         """
-        从 Neo4j 预加载所有 POI 编码, 仅做 Z-order 位运算得到 (x,y)。
-        Preload all POI codes from Neo4j; only Z-order bit ops to (x,y).
-        不调用 fast_code_to_center, 无经纬度解码。
-        Does not call fast_code_to_center; no lon/lat decode.
+        Preload source codes from Neo4j and decode Z-order bits to integer (x,y), without
+        fast_code_to_center or geographic decoding.
+
+        @param session Neo4j session.
+        @param source Target source.
+        @returns Number of POIs.
         """
         t0 = _t()
         rows = [dict(r) for r in session.run(
@@ -1052,13 +1002,9 @@ class POIGridCacheV6:
         level: int,
     ) -> np.ndarray:
         """
-        矩形范围筛选, 返回候选 mask。
-        Rectangle range filter; returns candidate mask.
+        Filter candidates by an integer rectangle. Right-shift ref_level coordinates to the query level.
 
-        通过右移将 ref_level 坐标缩放到查询级别。
-        Scale ref_level coords to query level via right shifts.
-
-        @returns bool 数组 (N_poi,) / bool array (N_poi,)
+        @returns Boolean mask of shape (N_poi,).
         """
         shift = self.ref_level - level
         qx = self.xy[:, 0] >> shift
@@ -1069,15 +1015,13 @@ class POIGridCacheV6:
 
 
 # ============================================================================
-# Plan Preloader — 仅存储折点编码, 不解码坐标 / Plan Preloader — store vertex codes only; no coordinate decode
+# Plan Preloader — store vertex codes only; no coordinate decode
 # ============================================================================
 
 class PlanPreloaderV6:
     """
-    预加载面状要素: 仅存储折点编码 (vertex_codes)。
-    Preload polygonal features: store vertex codes only.
-    不解码为经纬度坐标 — PIP 在整数网格空间完成。
-    No lon/lat decode — PIP runs in integer grid space.
+    Preload polygon vertex_codes only. PIP operates in integer grid space rather than decoded
+    lon/lat.
     """
 
     def __init__(self, session, verbose: bool = True):
@@ -1162,32 +1106,32 @@ class PlanPreloaderV6:
 
 
 # ============================================================================
-# GR 端 main_code 客户端索引 (与 PG pg_prewarm 等价对照) / GR-side main_code client index (counterpart to PG pg_prewarm)
+# GR-side main_code client index (counterpart to PG pg_prewarm)
 # ============================================================================
 #
-# 论文 Methodology 披露 (与距离实验同口径): / Methodology disclosure (same protocol as distance experiments):
-#   PG 端用 pg_prewarm 把表 + GiST/B-tree 索引拉进 shared_buffers; GR 端 / PG uses pg_prewarm to load tables + GiST/B-tree into shared_buffers; GR
-#   把指定 source 下的全部 main_code 一次性从 Neo4j 拉到 Python 内存, / pulls all main_codes for a source from Neo4j into Python memory once,
-#   按字典序排序后用 bisect 做本地前缀匹配 (O(log N + k)). 这是 graph / sorts lexicographically, and does local prefix match via bisect (O(log N + k)). This is graph
-#   索引的内存副本, 不是替代 - 节点 / 关系 / HAS_VERTEX_CODE / HAS_COMMON_PREFIX_CODE
-#   依然在 Neo4j 中, 是唯一权威数据源. / still lives in Neo4j as the sole authoritative data source.
+# Methodology disclosure (same protocol as distance experiments):
+# PG uses pg_prewarm to load tables + GiST/B-tree into shared_buffers; GR
+# pulls all main_codes for a source from Neo4j into Python memory once,
+# sorts lexicographically, and does local prefix match via bisect (O(log N + k)). This is graph
+# An in-memory index copy, not a replacement for nodes or HAS_VERTEX_CODE/HAS_COMMON_PREFIX_CODE edges.
+# still lives in Neo4j as the sole authoritative data source.
 
 import bisect as _bisect
 
 
 class MainCodeIndex:
     """
-    GR 端的客户端 main_code prefix 索引 (与 PG pg_prewarm 等价对照).
-    GR-side client main_code prefix index (counterpart to PG pg_prewarm).
+    Client-side main_code prefix index built during explicit G3R setup alongside PG prewarming.
 
-    @attr _sorted dict[source -> List[main_code]] 排序码表 / sorted code table
+    @attr _sorted Sorted main-code lists keyed by source.
+    @attr elapsed_sec Load time in seconds.
     """
 
     def __init__(self, session, sources, verbose: bool = True):
         """
-        @param session Neo4j session
-        @param sources 要预加载的 source 列表 (如 ["POI"]) / sources to preload (e.g. ["POI"])
-        @param verbose 是否打印 / whether to print
+        @param session Neo4j session.
+        @param sources Source names to preload, for example ["POI"].
+        @param verbose Whether to print progress.
         """
         self._sorted: Dict[str, List[str]] = {}
         t0 = _t()
@@ -1223,12 +1167,11 @@ class MainCodeIndex:
 
     def find_by_prefix(self, source: str, prefix: str) -> Set[str]:
         """
-        本地 prefix 匹配 (bisect, O(log N + k)).
-        Local prefix match (bisect, O(log N + k)).
+        Match a prefix locally with bisect in O(log N+k).
 
-        @param source 数据源 / data source
-        @param prefix GeoSOT 前缀 / GeoSOT prefix
-        @returns 命中的 main_code 列表 / hit main_codes
+        @param source Source name.
+        @param prefix GeoSOT prefix.
+        @returns Matching main_code set.
         """
         codes = self._sorted.get(source)
         if not codes:
@@ -1244,12 +1187,12 @@ class MainCodeIndex:
         return source in self._sorted and len(self._sorted[source]) > 0
 
 
-# 模块级单例, 由 main 在 setup 阶段注入; None 时回退到 Neo4j 查询 / Module singleton injected by main at setup; None falls back to Neo4j queries
+# Module singleton injected by main at setup; None falls back to Neo4j queries
 _main_code_index: Optional[MainCodeIndex] = None
 
 
 def set_main_code_index(idx: Optional[MainCodeIndex]):
-    """注入客户端 main_code 索引 (None 时回到 cold-cache 模式). / Inject client main_code index (None → cold-cache mode)."""
+    """Inject client main_code index (None → cold-cache mode)."""
     global _main_code_index
     _main_code_index = idx
 
@@ -1259,7 +1202,7 @@ def get_main_code_index() -> Optional[MainCodeIndex]:
 
 
 # ============================================================================
-# Neo4j 查询 + 前缀缓存 / Neo4j queries + prefix cache
+# Neo4j queries + prefix cache
 # ============================================================================
 
 _prefix_cache: Dict[Tuple[str, str], Set[str]] = {}
@@ -1272,7 +1215,7 @@ def _query_neo4j_single_prefix(
     if key in _prefix_cache:
         return _prefix_cache[key]
 
-    # 优先走本地索引 (与 PG pg_prewarm 等价对照) / Prefer local index (counterpart to PG pg_prewarm)
+    # Prefer local index (counterpart to PG pg_prewarm)
     if _main_code_index is not None and \
             _main_code_index.has_source(source):
         result = _main_code_index.find_by_prefix(source, prefix)
@@ -1310,13 +1253,10 @@ def _query_neo4j_by_cells(
     batch_size: int = 1024,
 ) -> List[str]:
     """
-    用最小前缀集批量 STARTS WITH 查询 Neo4j，返回候选编码。
-    Batch STARTS WITH on Neo4j with the minimal prefix set; return candidate codes.
-
-    知识图谱在此步骤中提供:
-    The knowledge graph provides here:
-      - GeoSOTCentroidCode 质心码节点的存储与 TEXT 索引
-      - GeoSOTCentroidCode centroid nodes and TEXT index
+    Batch Neo4j STARTS WITH queries for a minimal prefix set. The graph stores/indexes
+    GeoSOTCentroidCode nodes, constrains sources through CC-FROM_SOURCE->DataSource, and maps
+    spatial prefixes to candidates. When MainCodeIndex was installed during setup, local bisect
+    matching replaces Bolt queries; account for that materialization separately.
     """
     result_set: Set[str] = set()
     uncached: List[str] = []
@@ -1327,7 +1267,7 @@ def _query_neo4j_by_cells(
         else:
             uncached.append(prefix)
 
-    # 优先走本地 main_code 索引 / Prefer local main_code index
+    # Prefer local main_code index
     if uncached and _main_code_index is not None and \
             _main_code_index.has_source(source):
         for prefix in uncached:
@@ -1367,13 +1307,9 @@ def _query_neo4j_split(
     source: str, batch_size: int = 1024,
 ) -> Tuple[Set[str], Set[str]]:
     """
-    一次性批量 STARTS WITH 查询 inside + boundary 前缀，
-    直接利用 per-prefix 缓存拆分为两个结果集，避免二次调用。
-    One-shot batch STARTS WITH for inside + boundary prefixes;
-    split into two result sets via per-prefix cache; avoid a second call.
-
-    inside 前缀命中直接算结果; boundary 前缀命中需再 PIP。
-    inside prefix hits are results; boundary hits need PIP.
+    Query inside and boundary prefixes together, then split results using the per-prefix cache.
+    Quadtree BFS produces non-overlapping inside/boundary prefix regions, so one batch query
+    suffices without cross-contaminating the result groups.
     """
     all_cells = list(inside_cells) + list(boundary_cells)
     if all_cells:
@@ -1395,16 +1331,12 @@ def _fetch_polygon_vcodes_from_neo4j(
     session, main_code: str,
 ) -> Tuple[Optional[str], List[str], Optional[str], Optional[int]]:
     """
-    从 Neo4j 获取面状要素的折点编码 + 预计算的共同前缀。
+    Fetch ordered vertex codes and a precomputed LCPC through SpatialFeature-
+    HAS_VERTEX_CODE->GeoSOTVertexCode and feature-
+    HAS_COMMON_PREFIX_CODE->GeoSOTCommonPrefixCode. The importer computes the prefix once;
+    queries read it without recomputing LCP.
 
-    知识图谱模式:
-      (SpatialFeature)-[:HAS_VERTEX_CODE]->(GeoSOTVertexCode)
-      (SpatialFeature)-[:HAS_COMMON_PREFIX_CODE]->
-                   (GeoSOTCommonPrefixCode {prefix_code, prefix_level})
-    共同前缀节点由导入阶段预计算, 查询时无需现场
-    重算 LCP, 直接沿 HAS_COMMON_PREFIX_CODE 关系读取即可。
-
-    @returns (code_id, vertex_codes, prefix_code, prefix_level)
+    @returns (code_id, vertex_codes, prefix_code, prefix_level).
     """
     rows = [dict(r) for r in session.run(
         "MATCH (c:GeoSOTCentroidCode {main_code: $mc})"
@@ -1439,7 +1371,7 @@ def _fetch_polygon_vcodes_from_neo4j(
 
 
 # ============================================================================
-# 单条查询 / Single query
+# Single query
 # ============================================================================
 
 def run_single_query(
@@ -1468,7 +1400,7 @@ def run_single_query(
     print(f"  网格层级:   Level {GRID_LEVEL}")
     print(f"  最大网格数: {max_cells}")
 
-    # ── Step 1: 获取多边形折点编码 → (x,y) ── / ── Step 1: get polygon vertex codes → (x,y) ──
+    # ── Step 1: get polygon vertex codes → (x,y) ──
     print(f"\n{SEP}")
     print(f"  Step 1: 获取折点编码 → 整数网格坐标")
     print(f"{SEP}")
@@ -1511,15 +1443,15 @@ def run_single_query(
     print(f"  查询耗时:   {t_fetch:.1f} ms")
     print(f"  (x,y) 转换: {t_xy:.4f} ms")
 
-    # ── Step 2: Z-order 覆盖矩形 + 最小前缀集 ── / ── Step 2: Z-order cover rectangle + minimal prefix set ──
+    # ── Step 2: Z-order cover rectangle + minimal prefix set ──
     print(f"\n{SEP}")
     print(f"  Step 2: Z-order 覆盖矩形 + 最小前缀集")
     print(f"{SEP}")
 
     t0 = _t()
     vertex_xy_list = [tuple(row) for row in polygon_xy]
-        # 优先使用知识图谱中预计算的 GeoSOTCommonPrefixCode 节点, / Prefer precomputed GeoSOTCommonPrefixCode nodes in the knowledge graph;
-    # 仅当图里缺失 (数据未构建或零散多边形) 时回退到本地 LCP 计算。 / fall back to local LCP only when missing (data not built or sparse polygons).
+        # Prefer precomputed GeoSOTCommonPrefixCode nodes in the knowledge graph;
+    # fall back to local LCP only when missing (data not built or sparse polygons).
     if graph_prefix:
         lcp = graph_prefix
         lcp_lv = (graph_prefix_level
@@ -1572,7 +1504,7 @@ def run_single_query(
         for cc in cover_cells:
             print(f"    {cc}")
 
-    # ── Step 3-4: 自适应查询 ── / ── Step 3-4: adaptive query ──
+    # ── Step 3-4: adaptive query ──
     print(f"\n{SEP}")
     print(f"  Step 3-4: 自适应知识图谱匹配 + 绕数法 PIP")
     print(f"{SEP}")
@@ -1657,7 +1589,7 @@ def run_single_query(
           f"图匹配: {t_query:.1f} ms  |  "
           f"PIP: {t_pip:.3f} ms")
 
-    # ── 总结 ── / ── Summary ──
+    # ── Summary ──
     t_total = t_fetch + t_xy + t_grid + t_fill + t_query + t_pip
     print(f"\n  图推理总耗时: {t_total:.1f} ms")
     print(f"    1 获取折点编码:     {t_fetch:>8.1f} ms")
@@ -1670,7 +1602,7 @@ def run_single_query(
     print(f"    6 绕数PIP:          {t_pip:>8.3f} ms  "
           f"({n_pip_pass} 通过 / {n_pip_reject} 排除)")
 
-    # ── PostGIS 对比 ── / ── PostGIS comparison ──
+    # ── PostGIS comparison ──
     if compare_pg and pg_conn:
         print(f"\n{SEP}")
         print(f"  PostGIS ST_Intersects 对比")
@@ -1725,7 +1657,7 @@ def run_single_query(
 
 
 # ============================================================================
-# 批量测试 / Batch test
+# Batch test
 # ============================================================================
 
 CSV_FIELDS = [
@@ -1757,12 +1689,10 @@ def _preload_polygon_metrics(
     pg_conn, table: str, main_codes: List[str],
 ) -> Dict[str, Dict]:
     """
-    从 PostGIS 批量读取多边形的面积和经纬度跨度。
+    Batch-read polygon area and geographic span from PostGIS. ST_Area(geography) gives m^2;
+    ST_XMin/ST_XMax/ST_YMin/ST_YMax give spans in degrees.
 
-    ST_Area(geography) → 面积 (m²)
-    ST_XMin/ST_XMax/ST_YMin/ST_YMax → 经纬度跨度 (deg)
-
-    @returns {main_code: {area_m2, lon_span, lat_span}}
+    @returns {main_code: {area_m2, lon_span, lat_span}}.
     """
     if not pg_conn or not table or not main_codes:
         return {}
@@ -1843,7 +1773,7 @@ def run_batch(
 
         qcode = qc.strip().upper()
 
-        # 1. 获取折点编码 + 预计算共同前缀 (GeoSOTCommonPrefixCode 节点) / 1. Fetch vertex codes + precomputed common prefix (GeoSOTCommonPrefixCode nodes)
+        # 1. Fetch vertex codes + precomputed common prefix (GeoSOTCommonPrefixCode nodes)
         t0 = _t()
         plan_data = (plan_preloader.get_plan(qcode)
                      if plan_preloader else None)
@@ -1886,9 +1816,9 @@ def run_batch(
             })
             continue
 
-        # 2. 折点 → (x,y) + 覆盖矩形 / 2. Vertices → (x,y) + cover rectangle
-        # polygon_xy:     DMS 位打包整数, 用于格子级操作 (填充/MBR/前缀) / polygon_xy:     DMS bit-packed integers for cell-level ops (fill/MBR/prefix)
-        # polygon_xy_pip: 线性整数, 用于绕数法 PIP (避免 DMS 跨边界非线性) / polygon_xy_pip: linear integers for winding PIP (avoid DMS cross-border nonlinearity)
+        # 2. Vertices → (x,y) + cover rectangle
+        # polygon_xy:     DMS bit-packed integers for cell-level ops (fill/MBR/prefix)
+        # polygon_xy_pip: linear integers for winding PIP (avoid DMS cross-border nonlinearity)
         t0 = _t()
         polygon_xy = np.array(
             [_code_to_xy(vc, GRID_LEVEL) for vc in vcodes],
@@ -1898,7 +1828,7 @@ def run_batch(
 
         t0 = _t()
         vertex_xy_list = [tuple(row) for row in polygon_xy]
-        # 优先使用 GeoSOTCommonPrefixCode 节点中预计算的公共前缀 / Prefer common prefixes precomputed in GeoSOTCommonPrefixCode nodes
+        # Prefer common prefixes precomputed in GeoSOTCommonPrefixCode nodes
         if graph_prefix:
             lcp = graph_prefix
             lcp_lv = (graph_prefix_level
@@ -1924,11 +1854,11 @@ def run_batch(
             return _pip_winding_batch(
                 pts_lin, polygon_xy_pip, edge_eps=edge_eps)
 
-        # 3-4. 自适应策略: / 3-4. Adaptive strategy:
-        # LCP≥17        → 快速路径, 仅用 LCP 这一条前缀做入口 / LCP≥17        → fast path; use only this LCP prefix as entry
-        # LCP<17 且矩形前缀少 → 快速路径, 用覆盖矩形最小前缀集 / LCP<17 and few rect prefixes → fast path; use minimal cover-rect prefix set
-        # 其余             → 填充路径 / else             → fill path
-        # mbr_cover_pip=True → 强制内包层级 L 平铺覆盖 + 全部候选 PIP / mbr_cover_pip=True → force inscribed-level L tiled cover + PIP all candidates
+        # 3-4. Adaptive strategy:
+        # LCP≥17        → fast path; use only this LCP prefix as entry
+        # LCP<17 and few rect prefixes → fast path; use minimal cover-rect prefix set
+        # else             → fill path
+        # mbr_cover_pip=True → force inscribed-level L tiled cover + PIP all candidates
         use_fast_path_lcp = (lcp_lv >= FAST_PATH_LCP_LEVEL) and bool(lcp)
         use_mbr_cover = mbr_cover_pip
 
@@ -1973,7 +1903,7 @@ def run_batch(
                 strategy_row = "fast_path_min_prefix_forced"
             else:
                 strategy_row = "fast_path"
-            # ── 快速路径: 单前缀 (LCP) 或最小前缀集直接查 + 全部 PIP ── / ── Fast path: single prefix (LCP) or minimal prefix set + PIP all ──
+            # ── Fast path: single prefix (LCP) or minimal prefix set + PIP all ──
             t_fill = 0.0
             n_inside = 0
             n_boundary = n_cover
@@ -2006,7 +1936,7 @@ def run_batch(
         else:
             strategy_row = ("polygon_fill_all_pip"
                             if all_candidates_pip else "polygon_fill")
-            # ── 填充路径: 多分辨率填充 + 单次查询拆分 + 边界 PIP ── / ── Fill path: multi-res fill + one query split + boundary PIP ──
+            # ── Fill path: multi-res fill + one query split + boundary PIP ──
             t0 = _t()
             inside_pf, boundary_pf, n_inside, n_boundary, n_refine = \
                 _polygon_fill(polygon_xy, target_lv, max_depth,
@@ -2062,7 +1992,7 @@ def run_batch(
         t_gr_total = (t_fetch + t_vertex_xy + t_grid
                       + t_fill + t_query + t_pip)
 
-        # PostGIS 对比 / PostGIS comparison
+        # PostGIS comparison
         pg_count = ""
         t_pg_val_raw = ""
         t_pg_filter = 0.0
@@ -2199,7 +2129,7 @@ def run_batch(
               f"{c_codes:,} 个编码")
 
     # ================================================================
-    # 统计汇总 / Statistics summary
+    # Statistics summary
     # ================================================================
     valid_rows = [r for r in rows_out
                   if r.get("plan_vertices", 0) >= 3]
@@ -2228,7 +2158,7 @@ def run_batch(
                 f"Med={statistics.median(vals):>10.3f}  "
                 f"Max={max(vals):>10.3f}")
 
-    # ── 多边形统计 ── / ── Polygon stats ──
+    # ── Polygon stats ──
     vert_list = [r["plan_vertices"] for r in valid_rows]
     area_list = [r["pg_area_m2"] for r in valid_rows
                  if isinstance(r.get("pg_area_m2"), (int, float))]
@@ -2238,7 +2168,7 @@ def run_batch(
     lat_span_list = [r["pg_lat_span_deg"] for r in valid_rows
                      if isinstance(r.get("pg_lat_span_deg"),
                                    (int, float))]
-    print(f"\n  -- 多边形统计 --")
+    print(f'\n  -- Polygon statistics --')
     print(SEP)
     print(f"    顶点数:     {_stat3(vert_list)}")
     if area_list:
@@ -2248,7 +2178,7 @@ def run_batch(
     if lat_span_list:
         print(f"    纬度跨度(°): {_stat3(lat_span_list)}")
 
-    # ── 网格统计 ── / ── Grid stats ──
+    # ── Grid stats ──
     tl_list = [r["target_level"] for r in valid_rows]
     ra_list = [r["rect_area"] for r in valid_rows]
     fi_list = [r["n_fill_inside"] for r in valid_rows
@@ -2259,7 +2189,7 @@ def run_batch(
                if isinstance(r.get("n_fill_total"), (int, float))]
     hits_list = [r["n_hits"] for r in valid_rows]
 
-    print(f"\n  -- Z-order 网格统计 --")
+    print(f'\n  -- Z-order grid statistics --')
     print(SEP)
     print(f"    目标层级:   {_stat3(tl_list)}")
     print(f"    矩形面积:   {_stat3(ra_list)}")
@@ -2271,7 +2201,7 @@ def run_batch(
         print(f"    填充前缀总: {_stat3(ft_list)}")
     print(f"    命中要素:   {_stat3(hits_list)}")
 
-    # ── 分步耗时 ── / ── Step timings ──
+    # ── Step timings ──
     t_fetch_l = [r["t_fetch_ms"] for r in valid_rows]
     t_vxy_l = [r["t_vertex_xy_ms"] for r in valid_rows]
     t_grid_l = [r["t_grid_ms"] for r in valid_rows]
@@ -2280,7 +2210,7 @@ def run_batch(
     t_pip_l = [r["t_pip_ms"] for r in valid_rows]
     t_total_l = [r["t_gr_total_ms"] for r in valid_rows]
 
-    # ── 边界 PIP 统计 ── / ── Boundary PIP stats ──
+    # ── Boundary PIP stats ──
     bnd_cand_l = [r["n_boundary_candidates"] for r in valid_rows
                   if isinstance(r.get("n_boundary_candidates"),
                                 (int, float))]
@@ -2289,7 +2219,7 @@ def run_batch(
     pip_rej_l = [r["n_pip_reject"] for r in valid_rows
                  if isinstance(r.get("n_pip_reject"), (int, float))]
 
-    print(f"\n  -- 图推理分步耗时 (ms) --")
+    print(f'\n  -- Graph reasoning stage timings (ms) --')
     print(SEP)
     print(f"    1 获取折点编码:     {_stat5(t_fetch_l)}")
     print(f"    2 折点->(x,y):      {_stat5(t_vxy_l)}")
@@ -2300,7 +2230,7 @@ def run_batch(
     print(f"    合计:               {_stat5(t_total_l)}")
 
     if bnd_cand_l:
-        print(f"\n  -- 边界 PIP 统计 --")
+        print(f'\n  -- Boundary PIP statistics --')
         print(SEP)
         print(f"    boundary候选: {_stat3(bnd_cand_l)}")
         if pip_pass_l:
@@ -2322,7 +2252,7 @@ def run_batch(
             pct_ = statistics.mean(vals) / mean_total * 100
             print(f"      {label}: {pct_:>6.2f}%")
 
-    # ── PostGIS 对比 ── / ── PostGIS comparison ──
+    # ── PostGIS comparison ──
     if compare_pg:
         pg_rows = [r for r in valid_rows
                    if r.get("t_pg_ms", "") != ""]
@@ -2331,18 +2261,18 @@ def run_batch(
             pg_cnt_l = [r["pg_count"] for r in pg_rows]
             gr_h_l = [r["n_hits"] for r in pg_rows]
 
-            print(f"\n  -- PostGIS 耗时 (ms) --")
+            print(f'\n  -- PostGIS timings (ms) --')
             print(SEP)
             print(f"    ST_Intersects:      {_stat5(t_pg_l)}")
 
             sp_l = [r["speedup"] for r in pg_rows
                     if isinstance(r.get("speedup"), float)]
             if sp_l:
-                print(f"\n  -- 加速比 (PostGIS / 图推理) --")
+                print(f'\n  -- Speedup: PostGIS / graph reasoning --')
                 print(SEP)
                 print(f"    {_stat5(sp_l)}")
 
-            print(f"\n  -- 要素数量对比 --")
+            print(f'\n  -- Feature count comparison --')
             print(SEP)
             hdr = (f"    {'指标':>10s}  "
                    f"{'图推理':>12s}  {'PostGIS':>12s}")
@@ -2364,7 +2294,7 @@ def run_batch(
             fv = [r["f1"] for r in pg_rows
                   if isinstance(r.get("f1"), float)]
 
-            print(f"\n  -- 精度指标 (vs PostGIS 基准) --")
+            print(f'\n  -- Accuracy against the PostGIS reference --')
             print(SEP)
             if rv:
                 print(f"    召回率:  Mean="
@@ -2390,8 +2320,8 @@ def run_batch(
                       f"{nm}/{len(mr)} "
                       f"({nm/len(mr):.2%})")
 
-    # ── 论文引用摘要 ── / ── Paper citation summary ──
-    print(f"\n  -- 论文引用摘要 --")
+    # ── Paper citation summary ──
+    print(f'\n  -- Summary for paper reporting --')
     print(SEP)
     print(f"    查询总数:     {valid}")
     print("    查询策略:     adaptive (fast_path / polygon_fill)")
@@ -2430,7 +2360,7 @@ def run_batch(
 
 
 # ============================================================================
-# 主流程 / Main flow
+# Main flow
 # ============================================================================
 
 def _fetch_all_plan_codes(session, pg_conn, query_source):
@@ -2534,26 +2464,22 @@ def main():
               "--all --source POI --refine 4")
         print()
         print("参数:")
-        print("  --code CODE          查询面状要素的 main_code")
-        print(f"  --source SRC         目标 source "
-              f"(默认: {source})")
-        print(f"  --query-source SRC   查询要素 source "
-              f"(默认: {query_source})")
-        print("  --batch N            批量测试 N 个")
-        print("  --all                遍历所有面状要素")
-        print("  --codes-file FILE    按文件中的 plan_code 定向跑")
-        print("  --output FILE        CSV 输出路径")
-        print("  --no-postgis         不对比 PostGIS")
-        print("  --force-fast-min-prefix  强制最小前缀快速路径(不走填充)")
-        print("  --final-pg-filter    难样本启用PostGIS最终过滤")
-        print("  --final-strict-filter 难样本启用纯GeoSOT严格二次过滤")
-        print("  --all-candidates-pip 填充路径中全部候选统一过PIP")
-        print("  --mbr-cover-pip      使用内包层级L平铺覆盖+全部候选PIP")
-        print("  --mbr-cover-shrink N L 上再细化N级 (cell缩为1/2^N, 默认0)")
-        print(f"  --max-cells N        覆盖矩形最大网格数 "
-              f"(默认: {max_cells})")
-        print(f"  --refine N           边界细分级数 "
-              f"(默认: {refine_levels})")
+        print('  --code CODE          Query polygon main_code')
+        print(f'  --source SRC         Target source (default: {source})')
+        print(f'  --query-source SRC   Query feature source (default: {query_source})')
+        print('  --batch N            Test N features')
+        print('  --all                Process all polygon features')
+        print('  --codes-file FILE    Run plan_code values listed in a file')
+        print('  --output FILE        Output CSV path')
+        print('  --no-postgis         Skip the PostGIS comparison')
+        print('  --force-fast-min-prefix  Force the minimal-prefix fast path without filling')
+        print('  --final-pg-filter    Apply final PostGIS filtering to difficult cases')
+        print('  --final-strict-filter Apply strict GeoSOT secondary filtering to difficult cases')
+        print('  --all-candidates-pip Apply PIP to every fill-path candidate')
+        print('  --mbr-cover-pip      Tile at interior level L and apply PIP to every candidate')
+        print('  --mbr-cover-shrink N Refine L by N levels (cell size / 2^N; default 0)')
+        print(f'  --max-cells N        Maximum rectangle-cover cell count (default: {max_cells})')
+        print(f'  --refine N           Boundary refinement levels (default: {refine_levels})')
         return
 
     mode_desc = ("单条查询" if single_code
@@ -2588,7 +2514,7 @@ def main():
     if output_csv:
         print(f"  输出文件:   {output_csv}")
 
-    # [1] 连接数据库 / [1] Connect databases
+    # [1] Connect databases
     print(f"\n[1] 连接数据库 ...")
     t0 = time.perf_counter()
     driver = GraphDatabase.driver(
@@ -2608,10 +2534,10 @@ def main():
               f"{PG_CONFIG['port']}"
               f"/{PG_CONFIG['dbname']}  ({t_pg:.0f} ms)")
 
-        # ---- 公平性 setup: PG 预热 (pg_prewarm + ST_Intersects throwaway) ---- / ---- fairness setup: PG warmup (pg_prewarm + ST_Intersects throwaway) ----
-        # 论文 Methodology 应披露: PG GiST + B-tree 索引被 pg_prewarm 拉 / Methodology should disclose: PG GiST + B-tree indexes are pg_prewarm'ed
-        # 进 shared_buffers, 与 GR 端 PlanPreloaderV6 把多边形顶点预加载 / into shared_buffers, counterpart to GR PlanPreloaderV6 preloading polygon
-        # 到内存的 RAM-resident 状态等价对照. / vertices into RAM-resident memory.
+        # ---- fairness setup: PG warmup (pg_prewarm + ST_Intersects throwaway) ----
+        # Methodology should disclose: PG GiST + B-tree indexes are pg_prewarm'ed
+        # into shared_buffers, counterpart to GR PlanPreloaderV6 preloading polygon
+        # vertices into RAM-resident memory.
         from bench_setup import prepare_pg_warm
         used_tables = sorted({
             tbl for tbl in (
@@ -2634,7 +2560,7 @@ def main():
             ))
         prepare_pg_warm(pg_conn, used_tables, throwaway_sqls)
 
-    # [2] 查询 / [2] Query
+    # [2] Query
     poi_cache = None
 
     if single_code:
@@ -2652,10 +2578,10 @@ def main():
         print(f"    合计: {t_pp:.0f} ms, "
               f"{n_plans:,} 个 Plan 已就绪")
 
-        # ---- 公平性 setup: GR 端 main_code 客户端索引 ---- / ---- fairness setup: GR-side main_code client index ----
-        # 与 PG pg_prewarm 等价对照: 把目标 source 的全部 main_code / Counterpart to PG pg_prewarm: pull all target-source main_codes
-        # 从 Neo4j 拉到本地排序, 后续 prefix 匹配走 bisect, 不打 Neo4j. / from Neo4j, sort locally; later prefix match uses bisect, not Neo4j.
-        # 论文 Methodology 中 setup cost 单独披露. / Setup cost disclosed separately in Methodology.
+        # ---- fairness setup: GR-side main_code client index ----
+        # Counterpart to PG pg_prewarm: pull all target-source main_codes
+        # from Neo4j, sort locally; later prefix match uses bisect, not Neo4j.
+        # Setup cost disclosed separately in Methodology.
         print()
         print("─" * 76)
         print("  [bench_setup] GR client-side main_code index "
@@ -2663,7 +2589,7 @@ def main():
         print("─" * 76)
         mci = MainCodeIndex(session, sources=[source], verbose=True)
         set_main_code_index(mci)
-        # 同时清掉之前可能残留的 prefix_cache, 让 throwaway 重新热化 / Also clear any leftover prefix_cache so throwaway re-warms it
+        # Also clear any leftover prefix_cache so throwaway re-warms it
         prefix_cache_clear()
         print("─" * 76)
         print()
@@ -2681,7 +2607,7 @@ def main():
                 for c in df_codes["plan_code"].dropna().tolist()
                 if is_valid_g0_code(str(c).strip().upper())
             ]
-            # 去重并保持顺序 / Deduplicate while preserving order
+            # Deduplicate while preserving order
             seen = set()
             dedup_codes = []
             for c in plan_codes_list:
@@ -2701,10 +2627,10 @@ def main():
             print(f"  采样: {len(plan_codes_list)} 个")
         print(f"  总数: {len(plan_codes_list):,}")
 
-        # ---- 公平性 setup: 双侧 throwaway ---- / ---- fairness setup: dual-side throwaway ----
-        # 与距离实验保持一致: 跑 5 条真实 query 丢弃, 同时热化 / Same as distance experiments: run 5 real queries and discard; warm
-        # GR 端 _prefix_cache (Neo4j STARTS WITH 候选缓存) + / GR _prefix_cache (Neo4j STARTS WITH candidate cache) +
-        # PG 端 plan cache (ST_Intersects 形态), 之后才进入正式计时. / PG plan cache (ST_Intersects shape) before official timing.
+        # ---- fairness setup: dual-side throwaway ----
+        # Same as distance experiments: run 5 real queries and discard; warm
+        # GR _prefix_cache (Neo4j STARTS WITH candidate cache) +
+        # PG plan cache (ST_Intersects shape) before official timing.
         n_throwaway = min(5, len(plan_codes_list))
         if n_throwaway > 0:
             print(f"\n[2.5] 双侧 throwaway: 丢弃前 {n_throwaway} 条 query "

@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-GeoSOT 叠置查询 — 预加载 + NumPy bbox 过滤 + 射线法 PIP
-GeoSOT overlay query — preload + NumPy bbox filter + ray-casting PIP
+Overlay helpers using preloading, NumPy bbox filtering, and ray-casting PIP.
 
-给定一个面状要素的 main_code (如 Statutory Plan)，查出该多边形内 / Given a polygonal feature main_code (e.g. Statutory Plan), find
-包含的目标 source 要素 (如 POI)。 / target source features (e.g. POI) contained in that polygon.
+Given a polygon main_code, retrieve contained features from the target source. Setup fetches
+target codes, decodes their grid centers, and builds coordinate arrays/main-code indexes. A
+query fetches or reuses polygon vertices, filters candidates by vectorized bbox comparisons,
+then applies ray-casting PIP; target features need no additional Neo4j round trips.
 
-算法 (方案 A: 反向预加载法) / Algorithm (Plan A: reverse preload):
-  预加载阶段 (一次性) / Preload phase (once):
-    1. 从 Neo4j 查出所有目标 source 的 main_code / Load all target source main_codes from Neo4j
-    2. fast_code_to_center 解码为 (lon, lat) / Decode to (lon, lat)
-    3. 存入 NumPy 数组 (N x 2), 构建 main_code 索引 / Store NumPy array (N x 2), build main_code index
-
-  每次查询 (0 次额外 Neo4j 往返) / Per query (0 extra Neo4j round-trips):
-    1. 取 Plan 多边形顶点 (Neo4j 或缓存) / Fetch Plan polygon vertices (Neo4j or cache)
-    2. NumPy 向量化 bbox 过滤 → 少量候选 / Vectorized bbox filter → few candidates
-    3. 射线法 PIP 精确判断 / Ray-casting PIP exact test
-
-使用方法 / Usage:
+Usage:
     python geosot_overlay_query.py --code G0xxx --source POI
     python geosot_overlay_query.py --batch 50 --source POI --seed 42
     python geosot_overlay_query.py --all --source POI --output result.csv
@@ -61,7 +51,7 @@ POINT_SOURCES: Set[str] = {"POI"}
 
 
 # ============================================================================
-# 几何辅助 / Geometry helpers
+# Geometry helpers
 # ============================================================================
 
 def _point_in_polygon(
@@ -69,12 +59,12 @@ def _point_in_polygon(
     polygon: List[Tuple[float, float]],
 ) -> bool:
     """
-    射线法 (Ray Casting) 点在多边形测试。 / Ray-casting point-in-polygon test.
+    Ray-casting point-in-polygon test.
 
-    @param px 点 x (经度) / point x (longitude)
-    @param py 点 y (纬度) / point y (latitude)
-    @param polygon 多边形顶点 [(x, y), ...] / polygon vertices [(x, y), ...]
-    @returns 是否在内部 / whether inside
+    point x (longitude)
+    point y (latitude)
+    polygon vertices [(x, y), ...]
+    whether inside
     """
     n = len(polygon)
     if n < 3:
@@ -96,11 +86,11 @@ def _pip_batch(
     polygon: List[Tuple[float, float]],
 ) -> np.ndarray:
     """
-    批量射线法 PIP (NumPy 向量化)。 / Batch ray-casting PIP (NumPy vectorized).
+    Batch ray-casting PIP (NumPy vectorized).
 
-    @param pts (M, 2) 候选点坐标 / candidate point coordinates
-    @param polygon 多边形顶点 / polygon vertices
-    @returns bool 数组 (M,) / bool array (M,)
+    candidate point coordinates
+    polygon vertices
+    bool array (M,)
     """
     n_poly = len(polygon)
     if n_poly < 3 or len(pts) == 0:
@@ -128,22 +118,19 @@ def _pip_batch(
 
 
 # ============================================================================
-# 预加载器: 一次性加载目标 source 所有点要素坐标 / Preloader: load all target source point coords once
+# Preloader: load all target source point coords once
 # ============================================================================
 
 class FeaturePreloader:
     """
-    预加载指定 source 的所有要素坐标到内存。
-    Preload all feature coordinates of the given source into memory.
-
-    对点要素 (如 POI): 解码 main_code → (lon, lat), 存入 NumPy 数组。
-    For point features (e.g. POI): decode main_code → (lon, lat), store in NumPy array.
+    Preload feature coordinates for one source. For point features such as POI, decode main_code
+    into (lon, lat) and store NumPy arrays.
     """
 
     def __init__(self, session, verbose: bool = True):
         """
-        @param session Neo4j 会话 / Neo4j session
-        @param verbose 是否输出详细信息 / whether to print details
+        Neo4j session
+        whether to print details
         """
         self._session = session
         self._verbose = verbose
@@ -160,16 +147,15 @@ class FeaturePreloader:
 
     def preload(self, source: str) -> int:
         """
-        从 Neo4j 加载指定 source 的所有要素, 解码坐标。
-        Load all features of the given source from Neo4j and decode coordinates.
+        Load and decode all features from a source.
 
-        @param source 数据源名 (如 "POI") / data source name (e.g. "POI")
-        @returns 加载的要素数量 / number of loaded features
+        @param source Data source name, for example POI.
+        @returns Number of loaded features.
         """
         self._source = source
         _t = time.perf_counter
 
-        # Step 1: Neo4j 查出所有 main_code / query all main_codes from Neo4j
+        # query all main_codes from Neo4j
         t0 = _t()
         rows = [dict(r) for r in self._session.run(
             "MATCH (c:GeoSOTCode)"
@@ -184,7 +170,7 @@ class FeaturePreloader:
             print(f"    Neo4j 查询:  {t_query:.0f} ms  "
                   f"({len(rows):,} 条记录)")
 
-        # Step 2: 解码坐标 / decode coordinates
+        # decode coordinates
         t0 = _t()
         codes: List[str] = []
         code_ids: List[str] = []
@@ -229,14 +215,13 @@ class FeaturePreloader:
         max_lon: float, max_lat: float,
     ) -> np.ndarray:
         """
-        NumPy 向量化 bbox 过滤, 返回候选索引。
-        NumPy vectorized bbox filter; returns candidate indices.
+        Vectorized NumPy bbox filter.
 
-        @param min_lon bbox 最小经度 / bbox min longitude
-        @param min_lat bbox 最小纬度 / bbox min latitude
-        @param max_lon bbox 最大经度 / bbox max longitude
-        @param max_lat bbox 最大纬度 / bbox max latitude
-        @returns 候选在 self._coords 中的索引数组 / candidate indices into self._coords
+        @param min_lon Minimum longitude.
+        @param min_lat Minimum latitude.
+        @param max_lon Maximum longitude.
+        @param max_lat Maximum latitude.
+        @returns Candidate indexes into self._coords.
         """
         c = self._coords
         mask = ((c[:, 0] >= min_lon) & (c[:, 0] <= max_lon) &
@@ -248,12 +233,11 @@ class FeaturePreloader:
         polygon: List[Tuple[float, float]],
     ) -> np.ndarray:
         """
-        对 bbox 候选做射线法 PIP 精确判断。
-        Exact ray-casting PIP on bbox candidates.
+        Apply ray-casting PIP to bbox candidates.
 
-        @param idxs bbox_filter 返回的索引 / indices from bbox_filter
-        @param polygon 多边形顶点 / polygon vertices
-        @returns 在多边形内的索引数组 / indices inside the polygon
+        @param idxs Indexes returned by bbox_filter.
+        @param polygon Polygon vertices.
+        @returns Indexes of contained points.
         """
         if len(idxs) == 0:
             return idxs
@@ -263,7 +247,7 @@ class FeaturePreloader:
 
     def get_results(self, idxs: np.ndarray) -> List[Dict]:
         """
-        @param idxs 最终命中的索引 / final hit indices
+        final hit indices
         @returns [{main_code, code_id}, ...]
         """
         return [{"main_code": self._codes[i],
@@ -272,19 +256,18 @@ class FeaturePreloader:
 
 
 # ============================================================================
-# 获取查询多边形 / Fetch query polygon
+# Fetch query polygon
 # ============================================================================
 
 def fetch_polygon_from_neo4j(
     session, main_code: str,
 ) -> Tuple[Optional[str], List[str], List[Tuple[float, float]]]:
     """
-    从 Neo4j 获取面状要素的顶点编码并解码坐标。
-    Fetch polygonal feature vertex codes from Neo4j and decode coordinates.
+    Fetch polygon vertex codes from Neo4j and decode their coordinates.
 
-    @param session Neo4j 会话 / Neo4j session
-    @param main_code 面状要素 main_code / polygonal feature main_code
-    @returns (code_id, vertex_codes, polygon_coords)
+    @param session Neo4j session.
+    @param main_code Polygon main code.
+    @returns (code_id, vertex_codes, polygon_coords).
     """
     rows = [dict(r) for r in session.run(
         "MATCH (p:GeoSOTCode {main_code: $mc})\n"
@@ -323,12 +306,12 @@ def postgis_overlay_features(
     query_table: str, target_table: str,
 ) -> Tuple[List[str], float]:
     """
-    PostGIS ST_Intersects 查找叠置要素。 / Find overlay features via PostGIS ST_Intersects.
+    Find overlay features via PostGIS ST_Intersects.
 
-    @param pg_conn PostGIS 连接 / PostGIS connection
-    @param query_main_code 查询要素 main_code / query feature main_code
-    @param query_table 查询要素表名 / query feature table name
-    @param target_table 目标表名 / target table name
+    PostGIS connection
+    query feature main_code
+    query feature table name
+    target table name
     @returns (main_code_list, time_ms)
     """
     sql = (
@@ -348,7 +331,7 @@ def postgis_overlay_features(
 
 
 # ============================================================================
-# 单条查询 / Single query
+# Single query
 # ============================================================================
 
 def run_single_query(
@@ -360,13 +343,13 @@ def run_single_query(
     compare_pg: bool,
 ):
     """
-    @param session Neo4j 会话 / Neo4j session
-    @param pg_conn PostGIS 连接 / PostGIS connection
-    @param preloader 已预加载的要素数据 / preloaded feature data
-    @param query_code 查询面状要素 main_code / query polygon main_code
-    @param source 目标 source / target source
-    @param query_source 查询要素的 source / query feature source
-    @param compare_pg 是否对比 PostGIS / whether to compare with PostGIS
+    Neo4j session
+    PostGIS connection
+    preloaded feature data
+    query polygon main_code
+    target source
+    query feature source
+    whether to compare with PostGIS
     """
     W = 76
     SEP = f"  {'─' * (W - 4)}"
@@ -381,7 +364,7 @@ def run_single_query(
     print(f"  目标来源:   {source}")
     print(f"  预加载要素: {preloader.count:,}")
 
-    # Step 1: 获取多边形 / fetch polygon
+    # fetch polygon
     print(f"\n{SEP}")
     print(f"  Step 1: 获取多边形顶点")
     print(f"{SEP}")
@@ -403,7 +386,7 @@ def run_single_query(
     print(f"  纬度范围:   [{min_lat:.8f}, {max_lat:.8f}]")
     print(f"  耗时:       {t_fetch:.1f} ms")
 
-    # Step 2: NumPy bbox 过滤 / NumPy bbox filter
+    # NumPy bbox filter
     print(f"\n{SEP}")
     print(f"  Step 2: NumPy bbox 快速过滤")
     print(f"{SEP}")
@@ -417,7 +400,7 @@ def run_single_query(
           f"{preloader.count:,}")
     print(f"  耗时:       {t_bbox:.3f} ms")
 
-    # Step 3: 射线法 PIP / ray-casting PIP
+    # ray-casting PIP
     print(f"\n{SEP}")
     print(f"  Step 3: 射线法精确判断 (PIP)")
     print(f"{SEP}")
@@ -438,7 +421,7 @@ def run_single_query(
     print(f"    ③ PIP 精确判断:   {t_pip:>8.3f} ms  "
           f"({len(results)} 命中)")
 
-    # Step 4: PostGIS 对比 / PostGIS comparison
+    # PostGIS comparison
     if compare_pg and pg_conn:
         print(f"\n{SEP}")
         print(f"  Step 4: PostGIS ST_Intersects")
@@ -501,7 +484,7 @@ def run_single_query(
 
 
 # ============================================================================
-# 批量测试 / Batch test
+# Batch test
 # ============================================================================
 
 CSV_FIELDS = [
@@ -526,15 +509,15 @@ def run_batch(
     output_csv: str = "",
 ) -> List[Dict]:
     """
-    @param session Neo4j 会话 / Neo4j session
-    @param pg_conn PostGIS 连接 / PostGIS connection
-    @param preloader 已预加载的要素数据 / preloaded feature data
-    @param plan_codes 查询面状要素列表 / list of query polygon codes
-    @param source 目标 source / target source
-    @param query_source 查询要素 source / query feature source
-    @param compare_pg 是否 PostGIS 对比 / whether to compare with PostGIS
-    @param output_csv CSV 输出路径 / CSV output path
-    @returns 逐行结果列表 / per-row result list
+    Neo4j session
+    PostGIS connection
+    preloaded feature data
+    list of query polygon codes
+    target source
+    query feature source
+    whether to compare with PostGIS
+    CSV output path
+    per-row result list
     """
     W = 76
     SEP = f"  {'─' * (W - 4)}"
@@ -658,7 +641,7 @@ def run_batch(
         f"\r  [{'█' * 30}] 100.0%  {n:,}/{n:,}\n")
     sys.stdout.flush()
 
-    # CSV 输出 / CSV output
+    # CSV output
     if output_csv and rows_out:
         with open(output_csv, "w", newline="",
                   encoding="utf-8") as f:
@@ -670,7 +653,7 @@ def run_batch(
         print(f"\n  CSV 已保存: {output_csv}")
 
     # ================================================================
-    # 统计汇总 / Statistics summary
+    # Statistics summary
     # ================================================================
     valid_rows = [r for r in rows_out
                   if r.get("plan_vertices", 0) >= 3]
@@ -760,16 +743,16 @@ def run_batch(
 
 
 # ============================================================================
-# 主流程 / Main flow
+# Main flow
 # ============================================================================
 
 def _fetch_all_plan_codes(session, pg_conn, query_source: str):
     """
-    @brief 获取指定 source 的所有面状要素编码 / Get all polygon feature codes for a source
-    @param session Neo4j 会话 / Neo4j session
-    @param pg_conn PostGIS 连接 (可为 None) / PostGIS connection (may be None)
-    @param query_source 查询要素 source 名 / query feature source name
-    @returns 有效编码列表 / list of valid codes
+    Get all polygon feature codes for a source
+    Neo4j session
+    PostGIS connection (may be None)
+    query feature source name
+    list of valid codes
     """
     qt = SOURCE_TO_PG_TABLE.get(query_source, "")
     if pg_conn and qt:
@@ -841,15 +824,13 @@ def main():
               "--all --source POI --output result.csv")
         print()
         print("参数:")
-        print("  --code CODE        查询面状要素的 main_code")
-        print("  --source SRC       目标 source "
-              "(POI, Buildings, Road, Statutory Plan)")
-        print("  --query-source SRC 查询要素的 source "
-              f"(默认: {query_source})")
-        print("  --batch N          批量测试 N 个面状要素")
-        print("  --all              遍历所有面状要素")
-        print("  --output FILE      CSV 输出路径")
-        print("  --no-postgis       不对比 PostGIS")
+        print('  --code CODE        Query polygon main_code')
+        print('  --source SRC       Target source (POI, Buildings, Road, Statutory Plan)')
+        print(f'  --query-source SRC Query feature source (default: {query_source})')
+        print('  --batch N          Test N polygon features')
+        print('  --all              Process all polygon features')
+        print('  --output FILE      Output CSV path')
+        print('  --no-postgis       Skip the PostGIS comparison')
         return
 
     mode_desc = ("单条查询" if single_code
@@ -867,7 +848,7 @@ def main():
     if output_csv:
         print(f"  输出文件:   {output_csv}")
 
-    # [1] 连接 / connect
+    # connect
     print(f"\n[1] 连接数据库 ...")
     t0 = time.perf_counter()
     driver = GraphDatabase.driver(
@@ -886,7 +867,7 @@ def main():
         print(f"  PostGIS: {PG_CONFIG['host']}:{PG_CONFIG['port']}/"
               f"{PG_CONFIG['dbname']}  ({t_pg:.0f} ms)")
 
-    # [2] 预加载目标要素 / preload target features
+    # preload target features
     print(f"\n[2] 预加载 {source} 要素 ...")
     preloader = FeaturePreloader(session, verbose=True)
     t0 = time.perf_counter()
@@ -895,7 +876,7 @@ def main():
     print(f"    合计: {t_preload:.0f} ms, "
           f"{n_features:,} 个要素已就绪")
 
-    # [3] 查询 / query
+    # query
     if single_code:
         run_single_query(
             session, pg_conn, preloader,

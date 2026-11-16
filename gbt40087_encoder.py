@@ -1,11 +1,7 @@
 """
-GB/T 40087-2021 编码工具（东北半球，中国范围）
-GB/T 40087-2021 encoding tool (Northeast Hemisphere, China extent)
-
-支持点、线、面要素编码：
-Supports encoding of point, line, and polygon features:
-- 点：直接按坐标编码 / Point: encode by coordinates directly
-- 线/面：以质心作为主码，并输出折点编码 / Line/Polygon: use centroid as main code and output vertex codes
+GB/T 40087-2021 encoder for the northeastern hemisphere, with an optional China-range check.
+Points are encoded directly; lines and polygons use a centroid main code and an ordered
+vertex-code sequence.
 """
 
 import argparse
@@ -31,7 +27,7 @@ CHINA_LAT_MAX = 54.0
 
 @dataclass
 class EncodedFeature:
-    """@description 编码后的要素结果 / Encoded feature result"""
+    """Encoded feature result"""
 
     feature_index: int
     feature_name: str
@@ -43,16 +39,16 @@ class EncodedFeature:
     vertex_count: int
     vertex_codes: List[str]
     properties: Dict
-    geometry: object  # shapely geometry，用于 SHP 输出 / shapely geometry for SHP output
+    geometry: object  # Shapely geometries used for Shapefile output.
 
 
 def _to_dms_parts(value: float) -> Tuple[int, int, int, float]:
     """
-    @param value 十进制度坐标（仅支持非负） / Decimal-degree coordinate (non-negative only)
-    @returns (度, 分, 秒整数部分, 秒小数部分[0,1)) / (degree, minute, second integer, sub-second fraction [0,1))
+    Decimal-degree coordinate (non-negative only)
+    (degree, minute, second integer, sub-second fraction [0,1))
     """
     if value < 0:
-        raise ValueError("仅支持东北半球（经纬度必须为非负） / Northeast Hemisphere only (lon/lat must be non-negative)")
+        raise ValueError("仅支持东北半球（经纬度必须为非负）")
     degree = int(math.floor(value))
     minutes_float = (value - degree) * 60.0
     minute = int(math.floor(minutes_float))
@@ -64,27 +60,27 @@ def _to_dms_parts(value: float) -> Tuple[int, int, int, float]:
 
 def _to_fixed_bits(value: int, width: int) -> str:
     """
-    @param value 非负整数 / Non-negative integer
-    @param width 固定宽度 / Fixed bit width
-    @returns 固定宽度二进制字符串 / Fixed-width binary string
+    Non-negative integer
+    Fixed bit width
+    Fixed-width binary string
     """
     if value < 0 or value >= (1 << width):
-        raise ValueError(f"数值 {value} 超出 {width} bit 可表示范围 / Value {value} exceeds {width}-bit range")
+        raise ValueError(f"数值 {value} 超出 {width} bit 可表示范围")
     return format(value, f"0{width}b")
 
 
 def _coord_to_31_bits(value: float) -> str:
     """
-    @param value 十进制度坐标（经/纬） / Decimal-degree coordinate (lon/lat)
-    @returns 31bit 二进制（8bit度 + 6bit分 + 6bit秒 + 11bit秒以下） / 31-bit binary (8-bit deg + 6-bit min + 6-bit sec + 11-bit sub-sec)
+    Decimal-degree coordinate (lon/lat)
+    31-bit binary (8-bit deg + 6-bit min + 6-bit sec + 11-bit sub-sec)
     """
     degree, minute, second, sub_second = _to_dms_parts(value)
     if degree > 255:
-        raise ValueError("度值超出 8bit 上限（>255） / Degree exceeds 8-bit max (>255)")
+        raise ValueError("度值超出 8bit 上限（>255）")
     if minute > 59 or second > 59:
-        raise ValueError("分/秒值非法（应在 0~59） / Invalid minute/second (must be 0~59)")
+        raise ValueError("分/秒值非法（应在 0~59）")
 
-    # 秒以下按 11bit 量化，采用 floor，并做上限保护 / Quantize sub-second to 11 bits with floor and upper-bound clamp
+    # Quantize sub-second to 11 bits with floor and upper-bound clamp
     sub_second_quantized = int(sub_second * 2048.0)
     if sub_second_quantized > 2047:
         sub_second_quantized = 2047
@@ -99,12 +95,12 @@ def _coord_to_31_bits(value: float) -> str:
 
 def _interleave_lat_lon_to_quaternary(lat_bits: str, lon_bits: str) -> str:
     """
-    @param lat_bits 31bit 纬度二进制 / 31-bit latitude binary
-    @param lon_bits 31bit 经度二进制 / 31-bit longitude binary
-    @returns 31 位四进制字符串（莫顿交叉：纬度位在前，经度位在后） / 31-digit quaternary string (Morton: lat bit then lon bit)
+    31-bit latitude binary
+    31-bit longitude binary
+    31-digit quaternary string (Morton: lat bit then lon bit)
     """
     if len(lat_bits) != 31 or len(lon_bits) != 31:
-        raise ValueError("经纬度 bit 长度必须为 31 / Lon/lat bit length must be 31")
+        raise ValueError("经纬度 bit 长度必须为 31")
 
     quaternary_digits: List[str] = []
     for i in range(31):
@@ -122,49 +118,47 @@ def _interleave_lat_lon_to_quaternary(lat_bits: str, lon_bits: str) -> str:
 
 def encode_gbt40087_ne(lon: float, lat: float, level: int = 32) -> str:
     """
-    @param lon 经度（十进制度） / Longitude (decimal degrees)
-    @param lat 纬度（十进制度） / Latitude (decimal degrees)
-    @param level 编码级别（0~32） / Encoding level (0~32)
-    @returns GB/T 40087-2021 编码（东北半球：G0...） / GB/T 40087-2021 code (NE Hemisphere: G0...)
+    Longitude (decimal degrees)
+    Latitude (decimal degrees)
+    Encoding level (0~32)
+    GB/T 40087-2021 code (NE Hemisphere: G0...)
     """
     if level < 0 or level > 32:
-        raise ValueError("level 必须在 0~32 之间 / level must be between 0 and 32")
+        raise ValueError("level 必须在 0~32 之间")
     if level == 0:
         return "G"
     if level == 1:
         return "G0"
 
     if lon < 0 or lat < 0:
-        raise ValueError("仅支持东北半球（经纬度必须 >= 0） / Northeast Hemisphere only (lon/lat must be >= 0)")
+        raise ValueError("仅支持东北半球（经纬度必须 >= 0）")
     if lon > 180 or lat > 90:
-        raise ValueError("经纬度超出地理合法范围（lon<=180, lat<=90） / Lon/lat out of geographic range (lon<=180, lat<=90)")
+        raise ValueError("经纬度超出地理合法范围（lon<=180, lat<=90）")
 
     lat_bits = _coord_to_31_bits(lat)
     lon_bits = _coord_to_31_bits(lon)
     q31 = _interleave_lat_lon_to_quaternary(lat_bits, lon_bits)
 
-    # 级别定义： / Level definition:
-    # - 0级: G / Level 0: G
-    # - 1级: G0（东北半球） / Level 1: G0 (Northeast Hemisphere)
-    # - 2~32级: G0 + (level-1) 位细分四进制码 / Levels 2~32: G0 + (level-1) quaternary refinement digits
+    # Level definition:
+    # Level 0: G
+    # Level 1: G0 (Northeast Hemisphere)
+    # Levels 2~32: G0 + (level-1) quaternary refinement digits
     return "G0" + q31[: level - 1]
 
 
 def _check_china_range(lon: float, lat: float, strict: bool) -> None:
-    """@description 中国范围校验，可选严格模式 / China extent check, optional strict mode"""
+    """China extent check, optional strict mode"""
     if not strict:
         return
     if not (CHINA_LON_MIN <= lon <= CHINA_LON_MAX and CHINA_LAT_MIN <= lat <= CHINA_LAT_MAX):
         raise ValueError(
             f"坐标超出中国范围（{CHINA_LON_MIN}~{CHINA_LON_MAX}, {CHINA_LAT_MIN}~{CHINA_LAT_MAX}）："
             f"({lon}, {lat})"
-            f" / Coordinate outside China extent "
-            f"({CHINA_LON_MIN}~{CHINA_LON_MAX}, {CHINA_LAT_MIN}~{CHINA_LAT_MAX}): ({lon}, {lat})"
         )
 
 
 def _iter_vertices(geom) -> Iterable[Tuple[float, float]]:
-    """@description 提取几何折点坐标（点/线/面） / Extract vertex coordinates (point/line/polygon)"""
+    """Extract vertex coordinates (point/line/polygon)"""
     if isinstance(geom, Point):
         yield geom.x, geom.y
         return
@@ -179,11 +173,11 @@ def _iter_vertices(geom) -> Iterable[Tuple[float, float]]:
         for coord in coords:
             yield coord[0], coord[1]
         return
-    raise ValueError(f"不支持的几何类型: {type(geom)} / Unsupported geometry type: {type(geom)}")
+    raise ValueError(f"不支持的几何类型: {type(geom)}")
 
 
 def _explode_geometries(geom, base_name: str) -> List[Tuple[str, object]]:
-    """@description Multi 几何拆分 / Split Multi geometries"""
+    """Split Multi geometries"""
     if isinstance(geom, (Point, LineString, Polygon)):
         return [(base_name, geom)]
     if isinstance(geom, MultiPoint):
@@ -196,7 +190,7 @@ def _explode_geometries(geom, base_name: str) -> List[Tuple[str, object]]:
 
 
 def _feature_name(row, index: int, name_field: str) -> str:
-    """@description 优先读取指定字段名作为要素名 / Prefer reading the given field as feature name"""
+    """Prefer reading the given field as feature name"""
     if name_field and name_field in row and row[name_field] is not None and str(row[name_field]).strip():
         return str(row[name_field]).strip()
     return f"feature_{index}"
@@ -212,28 +206,28 @@ def encode_file(
     output_shp: str | None = None,
 ) -> str | None:
     """
-    @param input_path 输入空间文件（Shapefile/GeoJSON/GPKG 等） / Input spatial file (Shapefile/GeoJSON/GPKG, etc.)
-    @param output_csv 输出 CSV 路径，None 则不输出 CSV / Output CSV path; None means no CSV
-    @param level 编码级别 / Encoding level
-    @param strict_china 是否严格限制中国范围 / Whether to strictly enforce China extent
-    @param name_field 要素名称字段 / Feature name field
-    @param show_progress 是否显示进度条 / Whether to show progress bar
-    @param output_shp 可选，同时输出带编码属性表的 Shapefile 路径 / Optional Shapefile path with encoded attributes
-    @returns 最终输出 CSV 文件路径，未输出 CSV 时为 None / Final CSV path, or None if CSV not written
+    Input spatial file (Shapefile/GeoJSON/GPKG, etc.)
+    Output CSV path; None means no CSV
+    Encoding level
+    Whether to strictly enforce China extent
+    Feature name field
+    Whether to show progress bar
+    Optional Shapefile path with encoded attributes
+    Final CSV path, or None if CSV not written
     """
     if show_progress:
-        print("正在读取文件... / Reading file...", flush=True)
+        print("正在读取文件...", flush=True)
     gdf = gpd.read_file(input_path)
     if gdf.empty:
-        raise ValueError("输入文件为空 / Input file is empty")
+        raise ValueError("输入文件为空")
     n_total = len(gdf)
     if show_progress:
-        print(f"已读取 {n_total} 个要素，正在转换坐标系... / Read {n_total} features, converting CRS...", flush=True)
+        print(f"已读取 {n_total} 个要素，正在转换坐标系...", flush=True)
     if gdf.crs is None:
-        raise ValueError("输入数据缺少坐标系，请先设置 CRS / Input data has no CRS; set CRS first")
+        raise ValueError("输入数据缺少坐标系，请先设置 CRS")
     gdf = gdf.to_crs("EPSG:4490")
     if show_progress:
-        print("开始编码... / Starting encoding...", flush=True)
+        print("开始编码...", flush=True)
 
     results: List[EncodedFeature] = []
     feature_index = 0
@@ -242,7 +236,7 @@ def encode_file(
     iterator = tqdm(
         gdf.iterrows(),
         total=len(gdf),
-        desc="编码进度 / Encoding",
+        desc="编码进度",
         disable=not show_progress,
         mininterval=0.5,
         file=sys.stdout,
@@ -288,7 +282,7 @@ def encode_file(
             feature_index += 1
 
     if not results:
-        raise ValueError("没有可编码的有效几何 / No valid geometry to encode")
+        raise ValueError("没有可编码的有效几何")
 
     output_csv_path: str | None = None
     if output_csv:
@@ -343,7 +337,7 @@ def encode_file(
 
     if output_shp:
         if show_progress:
-            print("正在写入 Shapefile... / Writing Shapefile...", flush=True)
+            print("正在写入 Shapefile...", flush=True)
         _write_encoded_shp(results, output_shp, attr_fields)
 
     return output_csv_path
@@ -355,16 +349,14 @@ def _write_encoded_shp(
     attr_fields: List[str],
 ) -> None:
     """
-    将编码结果写入 Shapefile，编码字段写入属性表。
-    Write encoded results to Shapefile; encoding fields go into the attribute table.
-    Shapefile 字段名限制 10 字符，文本字段限制 254 字符，
-    Shapefile field names are limited to 10 chars and text fields to 254 chars,
-    故仅写入 main_code、level、vertex_count；完整 vertex_codes 仍以 CSV 为准。
-    so only main_code, level, and vertex_count are written; full vertex_codes remain in CSV.
+    Write encoded features to a Shapefile attribute table. Shapefile field names are limited to
+    10 characters and text values to 254 characters, so only main_code, level, and vertex_count
+    are written here. The CSV remains the authoritative output for the complete vertex_codes
+    sequence.
     """
     geometries = [r.geometry for r in results]
 
-    # 构建属性表：保留原有属性 + 编码字段（SHP 字段名≤10 字符） / Build attribute table: keep original attrs + encoding fields (SHP name ≤10 chars)
+    # Build attribute table: keep original attrs + encoding fields (SHP name ≤10 chars)
     data = {}
     for k in attr_fields:
         data[k] = [r.properties.get(k) for r in results]
@@ -384,49 +376,43 @@ def _write_encoded_shp(
 
 
 def build_cli() -> argparse.ArgumentParser:
-    """@returns 命令行参数解析器 / CLI argument parser"""
-    parser = argparse.ArgumentParser(
-        description="GB/T 40087-2021（东北半球，中国范围）编码工具 / GB/T 40087-2021 (NE Hemisphere, China) encoder"
-    )
-    parser.add_argument("--input", required=True, help="输入空间文件路径 / Input spatial file path")
-    parser.add_argument(
-        "--output",
-        default="",
-        help="输出 CSV 路径（默认与 SHP 一起输出，可单独指定以覆盖） / Output CSV path (default with SHP; override if set)",
-    )
-    parser.add_argument("--level", type=int, default=32, help="编码级别（0~32，默认 32） / Encoding level (0~32, default 32)")
+    """CLI argument parser"""
+    parser = argparse.ArgumentParser(description="GB/T 40087-2021（东北半球，中国范围）编码工具")
+    parser.add_argument("--input", required=True, help="输入空间文件路径")
+    parser.add_argument("--output", default="", help="输出 CSV 路径（默认与 SHP 一起输出，可单独指定以覆盖）")
+    parser.add_argument("--level", type=int, default=32, help="编码级别（0~32，默认 32）")
     parser.add_argument(
         "--strict-china",
         action="store_true",
-        help="启用中国范围严格校验（超出范围报错） / Enable strict China extent check (error if outside)",
+        help="启用中国范围严格校验（超出范围报错）",
     )
     parser.add_argument(
         "--name-field",
         default="",
-        help="用作要素名称的字段名（可选） / Field name used as feature name (optional)",
+        help="用作要素名称的字段名（可选）",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="关闭进度条显示 / Disable progress bar",
+        help="关闭进度条显示",
     )
     parser.add_argument(
         "--output-shp",
         default="",
-        help="输出 Shapefile 路径（默认与 CSV 一起输出，可单独指定以覆盖） / Output Shapefile path (default with CSV; override if set)",
+        help="输出 Shapefile 路径（默认与 CSV 一起输出，可单独指定以覆盖）",
     )
     return parser
 
 
 def main() -> None:
-    """@description 程序入口 / Program entry point"""
+    """Program entry point"""
     parser = build_cli()
     args = parser.parse_args()
 
     output_csv = args.output if args.output else None
     output_shp = args.output_shp if args.output_shp else None
     if not output_csv and not output_shp:
-        # 默认同时输出 CSV 和 SHP，基于输入路径生成 / Default: write both CSV and SHP based on input path
+        # Default: write both CSV and SHP based on input path
         base = os.path.splitext(os.path.basename(args.input))[0]
         out_dir = os.path.dirname(os.path.abspath(args.input))
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -443,9 +429,9 @@ def main() -> None:
         output_shp=output_shp,
     )
     if output_csv_path:
-        print(f"编码完成，输出 CSV：{output_csv_path} / Encoding done, CSV: {output_csv_path}")
+        print(f"编码完成，输出 CSV：{output_csv_path}")
     if output_shp:
-        print(f"编码完成，输出 Shapefile：{output_shp} / Encoding done, Shapefile: {output_shp}")
+        print(f"编码完成，输出 Shapefile：{output_shp}")
 
 
 if __name__ == "__main__":

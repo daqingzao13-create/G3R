@@ -1,49 +1,21 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-GeoSOT 反向叠置查询 — 给定要素, 找所属地块
-GeoSOT reverse overlay query — given a feature, find its containing parcel
+Reverse overlay: find containing parcels for a feature main_code. Convert its code to
+level-32 integer Z-order coordinates, retrieve candidate parcels by GeoSOTCommonPrefixCode
+prefixes or LCPC_HAS_LEVEL_k_DIGIT chains, and verify containment with integer winding-
+number PIP. PlanPolygonCache stores ordered polygon vertices as (N,2) int64 arrays during
+setup. The predicates share the forward-overlay/geometry cross-product primitives; optional
+PostGIS ST_Contains supplies a comparison.
 
-给定一个 POI (或其他点/面要素) 的编码 (main_code), 通过 GeoSOTCommonPrefixCode
-前缀匹配筛选候选地块 (如 Statutory Plan), 再用编码-only 绕数法 PIP
-精确判定.
-Given a POI (or other point/area feature) main_code, filter candidate parcels
-(e.g. Statutory Plan) via GeoSOTCommonPrefixCode prefix match, then exact-test
-with code-only winding-number PIP.
+Forward overlay maps parcel -> contained features; reverse overlay maps feature ->
+containing parcels.
 
-与 V3 的区别 / vs V3:
-  - V3: 给定地块 → 找地块内的要素 (正向覆盖 + 图推理)
-  - V3: given parcel → find features inside (forward cover + graph reasoning)
-  - 反向: 给定要素 → 找该要素所属的地块 (前缀匹配 + PIP)
-  - Reverse: given feature → find containing parcel (prefix match + PIP)
-
-算法 (与正向叠置 v7 / 几何推理共享同一编码-only 几何原理):
-Algorithm (same code-only geometry principles as forward overlay v7 / geometry reasoning):
-  1. 读取 POI 的 main_code, 通过位运算 _code_to_xy 直接映射到层级 32
-     的 Z-order 整数网格坐标 (无经纬度解码).
-     Read POI main_code; map via _code_to_xy bit ops to level-32 Z-order integer grid (no lon/lat decode).
-  2. 通过 GeoSOTCommonPrefixCode 前缀匹配找候选地块
-     策略 A: poi_code STARTS WITH prefix_code (Neo4j 索引)
-     策略 B: LCPC_HAS_LEVEL_k_DIGIT 层级数字链回退
-     Find candidate parcels via GeoSOTCommonPrefixCode prefix match
-     Strategy A: poi_code STARTS WITH prefix_code (Neo4j index)
-     Strategy B: LCPC_HAS_LEVEL_k_DIGIT digit-chain fallback
-  3. 候选地块的多边形顶点用同样位运算映射到 Z-order 整数网格
-     (PlanPolygonCache 在 setup 阶段一次性构建, 缓存为
-      Dict[main_code, (N, 2) int64 数组]).
-     Map candidate polygon vertices the same way (PlanPolygonCache built once at setup
-     as Dict[main_code, (N,2) int64 arrays]).
-  4. 绕数法 (Winding Number) PIP, 全链路整数运算, 无浮点误差,
-     无经纬度参与, 与 geosot_geometry_reasoning._cross /
-     geosot_overlay_query_v7._winding_number_batch 同一原理.
-     Winding-number PIP, all-integer, no float error, no lon/lat; same principle as
-     geosot_geometry_reasoning._cross / geosot_overlay_query_v7._winding_number_batch.
-  5. (可选) PostGIS ST_Contains 对比验证.
-     Optional PostGIS ST_Contains comparison.
-
-使用方法 / Usage:
+Usage:
     python geosot_reverse_query.py --code G0xxx
     python geosot_reverse_query.py --batch 50 --seed 42
+    python geosot_reverse_query.py --all --output result.csv
+    python geosot_reverse_query.py --all --strategy located_in
 """
 
 import csv
@@ -82,7 +54,7 @@ _t = time.perf_counter
 
 
 # ============================================================================
-# 几何辅助 / Geometry helpers
+# Geometry helpers
 # ============================================================================
 
 def _pip_single(
@@ -90,22 +62,13 @@ def _pip_single(
     polygon_xy: Optional[np.ndarray],
 ) -> bool:
     """
-    编码-only 绕数法 (Winding Number) PIP 单点测试.
-    Code-only winding-number PIP for a single point.
+    Test one point with integer winding-number PIP in level-32 coordinates obtained through
+    _code_to_xy, using the same cross-product primitive as forward overlay. No floating-point
+    division or geographic decoding is required.
 
-    输入坐标为 GeoSOT 编码经位运算 _code_to_xy 直接映射得到的
-    Z-order 整数网格坐标 (level=32), 全链路 int64 运算, 无浮点误差,
-    无经纬度参与. 与 geosot_overlay_query_v7._winding_number_batch
-    使用同一几何原理.
-    Inputs are Z-order integer grid coords (level=32) from _code_to_xy; all-int64,
-    no float error, no lon/lat. Same geometry principle as
-    geosot_overlay_query_v7._winding_number_batch.
-
-    @param poi_xy     POI 的 (x, y) Z-order 整数坐标 / POI (x,y) Z-order integers
-    @param polygon_xy (N, 2) int64 多边形顶点数组; None 或顶点 < 3 则为 False
-                      / (N,2) int64 polygon verts; None or <3 verts → False
-    @returns True 当且仅当 POI 严格落在多边形内部 (绕数 ≠ 0)
-             / True iff POI is strictly inside (winding ≠ 0)
+    @param poi_xy Integer (x,y) point.
+    @param polygon_xy (N,2) int64 vertices; None or fewer than three vertices returns False.
+    @returns True when the winding number is nonzero.
     """
     if polygon_xy is None or len(polygon_xy) < 3:
         return False
@@ -118,12 +81,11 @@ def _pip_batch(
     polygon_xy: Optional[np.ndarray],
 ) -> np.ndarray:
     """
-    编码-only 绕数法批量 PIP. 直接复用 v7 的 _winding_number_batch.
-    Code-only batch winding PIP. Reuses v7 _winding_number_batch.
+    Batch integer PIP, reusing V7's _winding_number_batch.
 
-    @param pts_xy     (M, 2) int64 候选点 / candidate points
-    @param polygon_xy (N, 2) int64 多边形顶点 / polygon vertices
-    @returns bool 数组 (M,) / bool array (M,)
+    @param pts_xy (M,2) int64 candidates.
+    @param polygon_xy (N,2) int64 vertices.
+    @returns (M,) boolean mask.
     """
     if polygon_xy is None or len(polygon_xy) < 3 or len(pts_xy) == 0:
         return np.zeros(len(pts_xy), dtype=bool)
@@ -131,7 +93,7 @@ def _pip_batch(
 
 
 def _bbox_of(polygon_xy: np.ndarray) -> Tuple[int, int, int, int]:
-    """多边形整数轴对齐包围盒 (min_x, max_x, min_y, max_y)。 / Integer axis-aligned polygon bbox (min_x, max_x, min_y, max_y)."""
+    """Integer axis-aligned polygon bbox (min_x, max_x, min_y, max_y)."""
     xs = polygon_xy[:, 0]
     ys = polygon_xy[:, 1]
     return (int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max()))
@@ -142,14 +104,9 @@ def _point_in_bbox(
     bbox: Optional[Tuple[int, int, int, int]],
 ) -> bool:
     """
-    点是否落在整数包围盒内 (含边界)。bbox 预筛: 盒外的点必然在多边形外,
-    可在昂贵的绕数法 PIP 之前以纯整数比较剔除绝大多数候选, 结果不变。
-    Whether point is inside the integer bbox (inclusive). bbox prefilter: out-of-box
-    points are outside the polygon; drop most candidates with pure integer compares
-    before expensive winding PIP; results unchanged.
-
-    @param x,y 点坐标 / point coords
-    @param bbox (min_x, max_x, min_y, max_y)
+    Inclusive integer bbox prefilter. Points outside the bbox cannot lie in the polygon, so
+    reject them before the more expensive winding-number test. A missing bbox returns True and
+    disables this prefilter.
     """
     if bbox is None:
         return True
@@ -158,7 +115,7 @@ def _point_in_bbox(
 
 
 # ============================================================================
-# 候选地块查询 — 策略 A: 前缀索引 / Candidate parcel query — strategy A: prefix index
+# Candidate parcel query — strategy A: prefix index
 # ============================================================================
 
 def _query_parcels_by_prefix(
@@ -167,21 +124,19 @@ def _query_parcels_by_prefix(
     parcel_source: str = "Statutory Plan",
 ) -> Tuple[List[Dict], float]:
     """
-    通过 GeoSOTCommonPrefixCode 前缀匹配查找候选地块。
-    Find candidate parcels via GeoSOTCommonPrefixCode prefix match.
+    Retrieve candidate parcels by exact lookup of the point code's prefixes against indexed
+    GeoSOTCommonPrefixCode.prefix_code, rather than a full-table STARTS WITH scan.
 
-    将 POI 编码的所有前缀字符串作为精确匹配条件，
-    利用 prefix_code 索引做高效查询。
-    Match all prefixes of the POI code exactly, using the prefix_code index.
+    @returns (candidate records [{mc, prefix}], elapsed milliseconds).
     """
-    # 从 POI 编码生成所有可能的前缀 (从最长到最短，最短取 "G0") / Generate all prefixes of the POI code (longest to shortest; shortest is "G0")
+    # Generate all prefixes of the POI code (longest to shortest; shortest is "G0")
     prefixes = [poi_code[:i] for i in range(len(poi_code), 1, -1)]
 
     t0 = _t()
     cp_idx = get_common_prefix_index()
     if cp_idx is not None and cp_idx.has_source(parcel_source):
-        # 本地倒排索引: 取每个 parcel 命中的最长 prefix / Local inverted index: take the longest hit prefix per parcel
-        # (与 Cypher 中 ORDER BY size(prefix) DESC + collect[0] 等价) / (equivalent to Cypher ORDER BY size(prefix) DESC + collect[0])
+        # Local inverted index: take the longest hit prefix per parcel
+        # (equivalent to Cypher ORDER BY size(prefix) DESC + collect[0])
         best_per_mc: Dict[str, str] = {}
         for pf in prefixes:
             for hit in cp_idx.query_prefixes([pf]):
@@ -218,17 +173,13 @@ def _query_parcels_by_prefix(
 
 
 # ============================================================================
-# 候选地块查询 — 策略 B: LCPC_HAS_LEVEL 层级数字链 / Candidate parcel query — strategy B: LCPC_HAS_LEVEL digit chain
+# Candidate parcel query — strategy B: LCPC_HAS_LEVEL digit chain
 # ============================================================================
 
 def _build_reverse_located_in_cypher(level: int) -> str:
     """
-    构建 LCPC_HAS_LEVEL 层级数字链反向查询 Cypher。
-    Build Cypher for reverse query via LCPC_HAS_LEVEL digit chain.
-
-    通过公共前缀码 (GeoSOTCommonPrefixCode) 的 LCPC_HAS_LEVEL_k_DIGIT
-    关系逐层缩小候选。
-    Narrow candidates level-by-level via GeoSOTCommonPrefixCode LCPC_HAS_LEVEL_k_DIGIT.
+    Build Cypher for reverse traversal of LCPC_HAS_LEVEL_k_DIGIT chains from shared level digits
+    to candidate LCPC parcels.
     """
     parts = [
         "MATCH (p:GeoSOTCommonPrefixCode)"
@@ -272,15 +223,12 @@ def _query_parcels_by_grid(
     parcel_source: str = "Statutory Plan",
 ) -> Tuple[List[Dict], float]:
     """
-    通过 LCPC_HAS_LEVEL_k_DIGIT 层级数字链逐层缩小范围查找候选地块。
-    Find candidate parcels by narrowing via LCPC_HAS_LEVEL_k_DIGIT digit chain.
+    Find candidate parcels through LCPC_HAS_LEVEL_k_DIGIT chains, refining from coarse to fine
+    levels until candidates are found or available levels are exhausted.
 
-    从最粗层级开始，逐层细化直到找到候选或层级用尽。
-    Start coarse and refine until candidates are found or levels are exhausted.
-
-    @returns (候选列表, 耗时ms) / (candidates, time_ms)
+    @returns (candidate parcels, elapsed milliseconds).
     """
-    body = poi_code[1:]  # 去掉 G / strip leading G
+    body = poi_code[1:]  # Remove the leading G.
     max_level = min(32, len(body))
     digits = list(body)
 
@@ -309,7 +257,7 @@ def _query_parcels(
     parcel_source: str,
     strategy: str = "prefix",
 ) -> Tuple[List[Dict], float]:
-    """统一入口。 / Unified entry point."""
+    """Unified entry point."""
     if strategy == "located_in":
         return _query_parcels_by_grid(
             session, poi_code, parcel_source)
@@ -319,7 +267,7 @@ def _query_parcels(
 
 
 # ============================================================================
-# PostGIS 对比 / PostGIS comparison
+# PostGIS comparison
 # ============================================================================
 
 def _postgis_reverse_query(
@@ -328,7 +276,7 @@ def _postgis_reverse_query(
     poi_table: str,
     parcel_table: str,
 ) -> Tuple[List[str], float]:
-    """PostGIS ST_Contains 查找包含该要素的地块。 / Find parcels containing the feature via PostGIS ST_Contains."""
+    """Find parcels containing the feature via PostGIS ST_Contains."""
     sql = (
         f"SELECT p.main_code "
         f"FROM {parcel_table} p, {poi_table} t "
@@ -346,7 +294,7 @@ def _postgis_reverse_query(
 
 
 # ============================================================================
-# 按需获取多边形 (单条查询模式) / Fetch polygons on demand (single-query mode)
+# Fetch polygons on demand (single-query mode)
 # ============================================================================
 
 def _fetch_polygons_for_codes(
@@ -354,11 +302,9 @@ def _fetch_polygons_for_codes(
     main_codes: List[str],
 ) -> Dict[str, np.ndarray]:
     """
-    批量按需获取指定 main_code 列表的多边形顶点 Z-order 整数坐标.
-    Batch on-demand fetch of polygon vertex Z-order integer coords for main_codes.
-
-    顶点编码经位运算 _code_to_xy 直接映射到层级 32 网格 (无经纬度解码),
-    Vertex codes map via _code_to_xy to level-32 grid (no lon/lat decode),
+    Fetch requested polygons on demand by main_code and map their vertex codes to level-32
+    integer coordinates with _code_to_xy, without geographic decoding. Each result is an (N,2)
+    int64 array matching PlanPolygonCache.get_polygon.
     """
     if not main_codes:
         return {}
@@ -390,32 +336,28 @@ def _fetch_polygons_for_codes(
             except Exception:
                 pass
         if len(xy_list) >= 3:
-            # DMS 位打包 -> 线性欧式整数空间, 消除分/秒进位空洞对绕数法的扭曲 / DMS bit-pack → linear Euclidean integer space; remove deg/min/sec carry holes that warp winding PIP
+            # DMS bit-pack → linear Euclidean integer space; remove deg/min/sec carry holes that warp winding PIP
             result[mc] = _xy_dms_to_linear(
                 np.asarray(xy_list, dtype=np.int64))
     return result
 
 
 # ============================================================================
-# Plan 多边形预加载器 / Plan polygon preloader
+# Plan polygon preloader
 # ============================================================================
 
 class PlanPolygonCache:
     """
-    预加载所有地块多边形顶点的 Z-order 整数坐标缓存.
-    Preload Z-order integer vertex caches for all parcel polygons.
-
-    与之前版本 (缓存 List[(lon, lat)]) 不同, 此实现完全沿用与正向叠置 v7
-    相同的"编码-only"整数几何空间.
-    Unlike the prior version (List[(lon,lat)]), this uses the same code-only integer
-    geometry space as forward overlay v7.
+    Preload parcel vertex codes as integer Z-order coordinate arrays. Unlike the older lon/lat-
+    list cache, this follows V7's code-to-integer path. Measured PIP uses integer winding
+    predicates without geographic decoding or floating-point division; setup cost is separate.
     """
 
     def __init__(self, session, verbose: bool = True):
         self._session = session
         self._verbose = verbose
         self._cache: Dict[str, np.ndarray] = {}
-        # 预计算整数包围盒 (min_x, max_x, min_y, max_y), 供 PIP bbox 预筛 / Precompute integer bbox (min_x, max_x, min_y, max_y) for PIP bbox prefilter
+        # Precompute integer bbox (min_x, max_x, min_y, max_y) for PIP bbox prefilter
         self._bbox: Dict[str, Tuple[int, int, int, int]] = {}
 
     @property
@@ -456,7 +398,7 @@ class PlanPolygonCache:
                 except Exception:
                     pass
             if len(xy_list) >= 3:
-                # DMS 位打包 -> 线性欧式整数空间, 消除分/秒进位空洞对绕数法的扭曲 / DMS bit-pack → linear Euclidean integer space; remove deg/min/sec carry holes that warp winding PIP
+                # DMS bit-pack → linear Euclidean integer space; remove deg/min/sec carry holes that warp winding PIP
                 arr = _xy_dms_to_linear(
                     np.asarray(xy_list, dtype=np.int64))
                 self._cache[mc] = arr
@@ -470,38 +412,39 @@ class PlanPolygonCache:
         return len(self._cache)
 
     def get_polygon(self, main_code: str) -> Optional[np.ndarray]:
-        """返回 (N, 2) int64 顶点 Z-order 数组; 不存在则 None. / Return (N,2) int64 Z-order vertex array; None if missing."""
+        """Return (N,2) int64 Z-order vertex array; None if missing."""
         return self._cache.get(main_code.strip().upper())
 
     def get_bbox(
         self, main_code: str,
     ) -> Optional[Tuple[int, int, int, int]]:
-        """返回预计算整数包围盒 (min_x, max_x, min_y, max_y); 不存在则 None. / Return precomputed integer bbox; None if missing."""
+        """Return precomputed integer bbox; None if missing."""
         return self._bbox.get(main_code.strip().upper())
 
 
 # ============================================================================
-# Plan parcel 共有前缀本地倒排索引 (与 PG pg_prewarm 等价对照) / Plan-parcel common-prefix local inverted index (counterpart to PG pg_prewarm)
+# Plan-parcel common-prefix local inverted index (counterpart to PG pg_prewarm)
 # ============================================================================
 
 class CommonPrefixIndex:
     """
-    GR 端的 plan parcel 共有前缀本地倒排索引.
-    GR-side plan-parcel common-prefix local inverted index.
+    Client-side inverted LCPC index for parcels. During setup, fetch (parcel.main_code,
+    prefix_code) pairs and build prefix_code -> set(main_codes). Queries union dictionary hits
+    for their prefix sets, avoiding per-query Bolt round trips. Report this explicit O(N)
+    materialization separately from query time, alongside PG prewarming.
 
-    setup 阶段一次性从 Neo4j 拉取所有 (parcel.main_code, GeoSOTCommonPrefixCode)
-    对, 构建 prefix -> [parcel_codes] 倒排。
-    At setup, pull all (parcel.main_code, GeoSOTCommonPrefixCode) pairs from Neo4j
-    and build prefix -> [parcel_codes] inverted lists.
+    @attr _index Prefix-to-parcel-code sets.
+    @attr elapsed_sec Load time in seconds.
+    @attr n_pairs Number of loaded parcel/prefix pairs.
     """
 
     def __init__(self, session,
                  parcel_source: str = "Statutory Plan",
                  verbose: bool = True):
         """
-        @param session Neo4j session
-        @param parcel_source Source 名称 (默认 Statutory Plan) / Source name (default Statutory Plan)
-        @param verbose 是否打印 / whether to print
+        @param session Neo4j session.
+        @param parcel_source Source name, default Statutory Plan.
+        @param verbose Whether to print progress.
         """
         self._index: Dict[str, Set[str]] = {}
         self._parcel_source = parcel_source
@@ -555,11 +498,10 @@ class CommonPrefixIndex:
 
     def query_prefixes(self, prefixes: List[str]) -> List[Dict]:
         """
-        本地批量前缀查询 (dict lookup).
-        Local batch prefix query (dict lookup).
+        Batch prefix lookup in the local dictionary.
 
-        @param prefixes POI 编码切片得到的一批前缀字符串 / prefixes sliced from POI code
-        @returns [{"main_code": ..., "prefix": ...}, ...]
+        @param prefixes Prefix strings sliced from a POI code.
+        @returns Matching [{"mc": parcel_main_code, "prefix": prefix_code}] pairs.
         """
         results: List[Dict] = []
         for pf in prefixes:
@@ -581,13 +523,13 @@ class CommonPrefixIndex:
         return self._parcel_source == source and self.is_loaded()
 
 
-# 模块级单例: setup 阶段注入, 查询期间所有路径透明使用. / Module singleton: injected at setup; used transparently on all query paths.
-# 为 None 时所有查询回退到原 Cypher 路径 (cold-cache 对照模式). / When None, all queries fall back to Cypher (cold-cache control mode).
+# Module singleton: injected at setup; used transparently on all query paths.
+# When None, all queries fall back to Cypher (cold-cache control mode).
 _common_prefix_index: Optional[CommonPrefixIndex] = None
 
 
 def set_common_prefix_index(idx: Optional[CommonPrefixIndex]):
-    """注入全局共有前缀索引 (None 时回到 cold-cache Cypher 模式). / Inject global common-prefix index (None → cold-cache Cypher)."""
+    """Inject global common-prefix index (None → cold-cache Cypher)."""
     global _common_prefix_index
     _common_prefix_index = idx
 
@@ -597,7 +539,7 @@ def get_common_prefix_index() -> Optional[CommonPrefixIndex]:
 
 
 # ============================================================================
-# 递进前缀匹配 + PIP (命中即停) / Progressive prefix match + PIP (stop on first hit)
+# Progressive prefix match + PIP (stop on first hit)
 # ============================================================================
 
 def _cascade_prefix_query(
@@ -609,14 +551,8 @@ def _cascade_prefix_query(
     tier_size: int = 5,
 ) -> Dict:
     """
-    逐层递进前缀匹配 + PIP，命中即停。
-    Progressive prefix match + PIP; stop on first hit.
-
-    从最长前缀开始，每次查询 tier_size 个前缀级别，
-    查完立即做 PIP 测试。一旦命中就终止，
-    避免短前缀产生过多候选。
-    Start from the longest prefix; query tier_size prefix levels at a time;
-    PIP immediately after each tier. Stop on hit to avoid too many short-prefix candidates.
+    Cascade prefix matching and PIP from longest prefixes downward, querying tier_size levels at
+    a time. Stop on a PIP hit to avoid broad, irrelevant candidates from shorter prefixes.
     """
     prefixes = [poi_code[:i] for i in range(len(poi_code), 1, -1)]
 
@@ -642,8 +578,8 @@ def _cascade_prefix_query(
         "p.prefix_code AS prefix"
     )
 
-    # 优先走本地倒排索引 (与 PG pg_prewarm 等价对照). / Prefer local inverted index (counterpart to PG pg_prewarm).
-    # 索引未注入时回退到 Cypher (cold-cache 对照模式). / If index not injected, fall back to Cypher (cold-cache control).
+    # Prefer local inverted index (counterpart to PG pg_prewarm).
+    # If index not injected, fall back to Cypher (cold-cache control).
     cp_idx = get_common_prefix_index()
 
     for tier_start in range(0, len(prefixes), tier_size):
@@ -672,7 +608,7 @@ def _cascade_prefix_query(
         t0 = _t()
         if polygon_cache:
             for c in new_candidates:
-                # bbox 预筛: 整数比较剔除盒外候选, 避免昂贵绕数法 PIP / bbox prefilter: integer compares drop out-of-box candidates before expensive winding PIP
+                # bbox prefilter: integer compares drop out-of-box candidates before expensive winding PIP
                 if not _point_in_bbox(
                         poi_xy, polygon_cache.get_bbox(c["mc"])):
                     continue
@@ -692,7 +628,7 @@ def _cascade_prefix_query(
             for c in new_candidates:
                 polygon_xy = local_polys.get(c["mc"])
                 if polygon_xy is not None and len(polygon_xy) >= 3:
-                    # bbox 预筛 (即时计算包围盒) / bbox prefilter (compute bbox on the fly)
+                    # bbox prefilter (compute bbox on the fly)
                     if not _point_in_bbox(poi_xy, _bbox_of(polygon_xy)):
                         continue
                     n_decoded += 1
@@ -717,7 +653,7 @@ def _cascade_prefix_query(
 
 
 # ============================================================================
-# 邻域投票策略 — 基于知识图谱 EAST_OF / NORTH_OF 空间推理
+# Neighborhood voting through the graph's EAST_OF/NORTH_OF relations.
 # ============================================================================
 
 _DIGIT_XY = {"0": (0, 0), "1": (1, 0), "2": (0, 1), "3": (1, 1)}
@@ -726,11 +662,8 @@ _XY_DIGIT = {v: k for k, v in _DIGIT_XY.items()}
 
 def _preload_neighbor_cache(session) -> Dict:
     """
-    从知识图谱预加载 EAST_OF / NORTH_OF 邻居关系。
-    Preload EAST_OF / NORTH_OF neighbor relations from the knowledge graph.
-
-    缓存格式: (level, digit, direction) -> neighbor_digit
-    Cache format: (level, digit, direction) -> neighbor_digit
+    Preload graph EAST_OF/NORTH_OF adjacency. Cache keys are (level, digit, direction), with
+    neighbor_digit values.
     """
     cache: Dict[Tuple, str] = {}
     for level in range(1, 33):
@@ -759,13 +692,9 @@ def _graph_find_neighbor(
     nb_cache: Dict,
 ) -> Optional[str]:
     """
-    通过知识图谱 EAST_OF/NORTH_OF 关系递归查找邻居前缀编码。
-    Recursively find neighbor prefix codes via EAST_OF/NORTH_OF relations.
-
-    同层有邻居时直接返回；跨父网格边界时递归上溯，
-    找到父级邻居后再回到本层选择对侧子格。
-    Return same-level neighbors directly; if crossing a parent border, recurse up,
-    then pick the opposite child cell at this level.
+    Resolve a neighboring prefix through EAST_OF/NORTH_OF. Return an available same-parent
+    neighbor directly; when crossing a parent boundary, recurse to its neighbor and descend to
+    the opposite child.
     """
     body = prefix[1:]
     level = len(body)
@@ -801,13 +730,8 @@ def _find_8_neighbors(
     prefix: str, nb_cache: Dict,
 ) -> Dict[str, str]:
     """
-    通过知识图谱找 8 邻域前缀编码。
-    Find 8-neighborhood prefix codes via the knowledge graph.
-
-    4 基本方向直接查 EAST_OF/NORTH_OF；
-    4 对角方向组合两次基本方向（先纵后横）。
-    4 cardinal directions via EAST_OF/NORTH_OF;
-    4 diagonals by composing two cardinal steps (vertical then horizontal).
+    Find eight neighboring prefixes through graph adjacency. Query the four cardinal directions
+    directly and combine vertical then horizontal moves for the four diagonals.
     """
     result: Dict[str, str] = {}
 
@@ -835,7 +759,7 @@ def _find_8_neighbors(
 
 
 def _lcp2(a: str, b: str) -> str:
-    """两个字符串的最长公共前缀。 / Longest common prefix of two strings."""
+    """Longest common prefix of two strings."""
     n = min(len(a), len(b))
     for i in range(n):
         if a[i] != b[i]:
@@ -853,13 +777,9 @@ def _neighbor_voting_query(
     tier_size: int = 5,
 ) -> Dict:
     """
-    邻域投票策略: 前缀递进 + 图推理 8 邻域 + 投票排序。
-    Neighborhood voting: progressive prefixes + graph 8-neighborhood + vote ranking.
-
-    Phase 1: 从最长前缀开始递进查找候选，PIP 测试
-    Phase 1: progressive candidate search from longest prefix + PIP
-    Phase 2: 未命中时，通过 EAST_OF/NORTH_OF 找 8 邻域并投票
-    Phase 2: on miss, find 8-neighborhood via EAST_OF/NORTH_OF and vote
+    Neighborhood voting: phase 1 cascades prefixes and tests PIP; after no hit, phase 2 follows
+    EAST_OF/NORTH_OF to eight neighbors, computes point/neighbor LCPs, and performs directed
+    prefix queries plus voting. Phase 3 cascades through any remaining prefixes.
     """
     prefixes = [poi_code[:i] for i in range(len(poi_code), 1, -1)]
 
@@ -920,7 +840,7 @@ def _neighbor_voting_query(
         t0 = _t()
         if polygon_cache:
             for c in cands:
-                # bbox 预筛: 整数比较剔除盒外候选, 避免昂贵绕数法 PIP / bbox prefilter: integer compares drop out-of-box candidates before expensive winding PIP
+                # bbox prefilter: integer compares drop out-of-box candidates before expensive winding PIP
                 if not _point_in_bbox(
                         poi_xy, polygon_cache.get_bbox(c["mc"])):
                     continue
@@ -939,7 +859,7 @@ def _neighbor_voting_query(
             for c in cands:
                 poly_xy = lp.get(c["mc"])
                 if poly_xy is not None and len(poly_xy) >= 3:
-                    # bbox 预筛 (即时计算包围盒) / bbox prefilter (compute bbox on the fly)
+                    # bbox prefilter (compute bbox on the fly)
                     if not _point_in_bbox(poi_xy, _bbox_of(poly_xy)):
                         continue
                     n_decoded += 1
@@ -952,7 +872,7 @@ def _neighbor_voting_query(
         t_pip += (_t() - t0) * 1000
         return hits
 
-    # ── Phase 1: 递进前缀匹配 ── / ── Phase 1: progressive prefix match ──
+    # ── Phase 1: progressive prefix match ──
     for tier_start in range(0, len(prefixes), tier_size):
         batch = prefixes[tier_start:tier_start + tier_size]
         new_cands = _dedup(_q(batch))
@@ -969,9 +889,9 @@ def _neighbor_voting_query(
         if pip_results:
             method = "prefix_direct"
             break
-        break  # 有候选无 PIP 命中 → 转入邻域投票 / candidates but no PIP hit → neighborhood voting
+        break  # Candidates without a PIP hit proceed to neighborhood voting.
 
-    # ── Phase 2: 图推理 8 邻域 + 投票 ── / ── Phase 2: graph 8-neighborhood + voting ──
+    # ── Phase 2: graph 8-neighborhood + voting ──
     if not pip_results and deepest_prefix and nb_cache:
         t0_nb = _t()
         neighbors = _find_8_neighbors(deepest_prefix, nb_cache)
@@ -1002,7 +922,7 @@ def _neighbor_voting_query(
                 if pip_results:
                     method = "neighbor_voting"
 
-    # ── Phase 3: 回退 cascade ── / ── Phase 3: fallback cascade ──
+    # ── Phase 3: fallback cascade ──
     if not pip_results:
         tried = {str(c.get("prefix", ""))
                  for c in all_candidates}
@@ -1036,7 +956,7 @@ def _neighbor_voting_query(
 
 
 # ============================================================================
-# 单条查询 / Single query
+# Single query
 # ============================================================================
 
 def run_single_query(
@@ -1061,15 +981,15 @@ def run_single_query(
     print(f"  地块来源:   {parcel_source}")
     print(f"  查询策略:   {strategy}")
 
-    # ── Step 1: 获取要素坐标 (编码-only Z-order 映射) ── / ── Step 1: get feature coords (code-only Z-order map) ──
-    # 计时阶段仅做 _code_to_xy 位运算; lon/lat 仅作为诊断列在计时之外解码. / Timed stage is only _code_to_xy bit ops; lon/lat decoded outside timing as diagnostics.
+    # ── Step 1: get feature coords (code-only Z-order map) ──
+    # Timed stage is only _code_to_xy bit ops; lon/lat decoded outside timing as diagnostics.
     print(f"\n{SEP}")
     print(f"  Step 1: 获取要素坐标 (Z-order 整数映射)")
     print(f"{SEP}")
 
     t0 = _t()
     try:
-        # DMS 位打包 -> 线性欧式整数空间 (与多边形顶点同坐标系), 保证绕数法 PIP 正确 / DMS bit-pack → linear Euclidean int space (same frame as polygon verts) so winding PIP is correct
+        # DMS bit-pack → linear Euclidean int space (same frame as polygon verts) so winding PIP is correct
         poi_xy = _xy_dms_to_linear(
             np.asarray(_code_to_xy(qcode, _GRID_LEVEL), dtype=np.int64))
     except Exception as e:
@@ -1087,7 +1007,7 @@ def run_single_query(
           f"({poi_lon:.8f}, {poi_lat:.8f})")
     print(f"  耗时:       {t_decode_poi:.4f} ms")
 
-    # ── Step 2: 递进前缀匹配 + PIP ── / ── Step 2: progressive prefix match + PIP ──
+    # ── Step 2: progressive prefix match + PIP ──
     print(f"\n{SEP}")
     print(f"  Step 2: 递进匹配 + 编码-only 绕数法 PIP (策略: {strategy})")
     print(f"{SEP}")
@@ -1141,7 +1061,7 @@ def run_single_query(
                 polygon_xy = _local_cache.get(mc)
             if polygon_xy is None or len(polygon_xy) < 3:
                 continue
-            # bbox 预筛: 盒外候选必然在多边形外, 跳过昂贵绕数法 PIP / bbox prefilter: out-of-box candidates are outside the polygon; skip expensive winding PIP
+            # bbox prefilter: out-of-box candidates are outside the polygon; skip expensive winding PIP
             bbox = (polygon_cache.get_bbox(mc) if polygon_cache
                     else _bbox_of(polygon_xy))
             if not _point_in_bbox(poi_xy, bbox):
@@ -1189,7 +1109,7 @@ def run_single_query(
             for lp in nb_lcps[:5]:
                 print(f"      {lp}  (level {len(lp) - 1})")
 
-    # ── 总结 ── / ── Summary ──
+    # ── Summary ──
     t_total = t_decode_poi + t_query + t_pip
     print(f"\n  图推理总耗时: {t_total:.1f} ms")
     print(f"    ① 解码要素坐标:     {t_decode_poi:>8.4f} ms")
@@ -1198,7 +1118,7 @@ def run_single_query(
     print(f"    ③ 解码+PIP:         {t_pip:>8.3f} ms  "
           f"({len(results)} 命中)")
 
-    # ── Step 4: PostGIS 对比 ── / ── Step 4: PostGIS comparison ──
+    # ── Step 4: PostGIS comparison ──
     if compare_pg and pg_conn:
         print(f"\n{SEP}")
         print(f"  Step 4: PostGIS ST_Contains")
@@ -1233,7 +1153,7 @@ def run_single_query(
             if t_total > 0:
                 print(f"    比率:    {t_pg / t_total:.2f}x")
 
-    # ── 结果展示 ── / ── Result display ──
+    # ── Result display ──
     if results:
         print(f"\n{SEP}")
         print(f"  所属地块 ({len(results)} 个)")
@@ -1249,29 +1169,29 @@ def run_single_query(
 
 
 # ============================================================================
-# 批量测试 / Batch test
+# Batch test
 # ============================================================================
 
 CSV_FIELDS = [
-    # 基本信息 / Basic info
+    # Basic info
     "poi_idx", "poi_code", "poi_lon", "poi_lat",
-    # 图推理结果 / Graph-reasoning results
+    # Graph-reasoning results
     "n_candidates", "n_decoded", "pip_hits",
     "gr_matched_codes",
-    # 分步耗时 (ms) / Step timings (ms)
+    # Step timings (ms)
     "t_decode_poi_ms", "t_query_ms", "t_pip_ms",
     "t_gr_total_ms",
-    # 邻域投票详情 / Neighborhood-voting details
+    # Neighborhood-voting details
     "method", "deepest_prefix", "deepest_prefix_level",
     "n_neighbors", "n_neighbor_lcps",
-    # PostGIS 对比 / PostGIS comparison
+    # PostGIS comparison
     "pg_count", "pg_matched_codes", "t_pg_ms",
     "speedup",
-    # 精度指标 / Accuracy metrics
+    # Accuracy metrics
     "recall", "precision", "f1", "match",
     "gr_only_count", "gr_only_codes",
     "pg_only_count", "pg_only_codes",
-    # 元信息 / Metadata
+    # Metadata
     "strategy",
 ]
 
@@ -1330,10 +1250,10 @@ def run_batch(
 
         qcode = pc.strip().upper()
 
-        # 1. 编码-only Z-order 映射 (计时); lon/lat 仅作 CSV 诊断列, 不计时 / 1. Code-only Z-order map (timed); lon/lat only as CSV diagnostics, not timed
+        # 1. Code-only Z-order map (timed); lon/lat only as CSV diagnostics, not timed
         t0 = _t()
         try:
-            # DMS 位打包 -> 线性欧式整数空间 (与多边形顶点同坐标系), 保证绕数法 PIP 正确 / DMS bit-pack → linear Euclidean int space (same frame as polygon verts) so winding PIP is correct
+            # DMS bit-pack → linear Euclidean int space (same frame as polygon verts) so winding PIP is correct
             poi_xy = _xy_dms_to_linear(
                 np.asarray(_code_to_xy(qcode, _GRID_LEVEL), dtype=np.int64))
         except Exception:
@@ -1352,7 +1272,7 @@ def run_batch(
         except Exception:
             poi_lon, poi_lat = float("nan"), float("nan")
 
-        # 2+3. 递进前缀匹配 + 编码-only 绕数法 PIP (命中即停) / 2+3. Progressive prefix match + code-only winding PIP (stop on hit)
+        # 2+3. Progressive prefix match + code-only winding PIP (stop on hit)
         nb_method = ""
         nb_deepest = ""
         nb_n_neighbors = 0
@@ -1405,7 +1325,7 @@ def run_batch(
         t_gr_total = t_decode_poi + t_query + t_pip
         gr_set = set(gr_results)
 
-        # 4. PostGIS 对比 / 4. PostGIS comparison
+        # 4. PostGIS comparison
         pg_count = ""
         pg_matched_str = ""
         t_pg_val = ""
@@ -1495,7 +1415,7 @@ def run_batch(
             f"\r  [{'#' * 30}] 100.0%  {n:,}/{n:,}\n")
     sys.stdout.flush()
 
-    # CSV 输出 / CSV output
+    # CSV output
     if output_csv and rows_out:
         with open(output_csv, "w", newline="",
                   encoding="utf-8-sig") as f:
@@ -1509,7 +1429,7 @@ def run_batch(
               f"{len(CSV_FIELDS)} 列)")
 
     # ================================================================
-    # 统计汇总 / Statistics summary
+    # Statistics summary
     # ================================================================
     valid_rows = [r for r in rows_out
                   if r.get("poi_lon", "") != ""]
@@ -1538,7 +1458,7 @@ def run_batch(
                 f"Med={statistics.median(vals):>10.3f}  "
                 f"Max={max(vals):>10.3f}")
 
-    # ── 候选与命中统计 ── / ── Candidate & hit stats ──
+    # ── Candidate & hit stats ──
     cand_list = [r["n_candidates"] for r in valid_rows]
     decoded_list = [r["n_decoded"] for r in valid_rows]
     hits_list = [r["pip_hits"] for r in valid_rows]
@@ -1553,7 +1473,7 @@ def run_batch(
     print(f"    有命中的查询: {n_has_hit}/{valid} "
           f"({n_has_hit / valid:.1%})")
 
-    # ── 分步耗时 ── / ── Step timings ──
+    # ── Step timings ──
     t_decode_list = [r["t_decode_poi_ms"] for r in valid_rows]
     t_query_list = [r["t_query_ms"] for r in valid_rows]
     t_pip_list = [r["t_pip_ms"] for r in valid_rows]
@@ -1577,7 +1497,7 @@ def run_batch(
             pct_ = statistics.mean(vals) / mean_total * 100
             print(f"      {label}: {pct_:>6.2f}%")
 
-    # ── PostGIS 对比 ── / ── PostGIS comparison ──
+    # ── PostGIS comparison ──
     if compare_pg:
         pg_rows = [r for r in valid_rows
                    if r.get("t_pg_ms", "") != ""]
@@ -1642,7 +1562,7 @@ def run_batch(
                       f"{n_match}/{len(match_rows)} "
                       f"({n_match / len(match_rows):.2%})")
 
-    # ── 论文引用摘要 ── / ── Paper citation summary ──
+    # ── Paper citation summary ──
     print(f"\n  ── 论文引用摘要 ──")
     print(SEP)
     print(f"    查询总数:     {valid}")
@@ -1665,15 +1585,14 @@ def run_batch(
 
 
 # ============================================================================
-# 主流程 / Main flow
+# Main flow
 # ============================================================================
 
 def _read_codes_from_csv(path: str) -> List[str]:
-    """读取先前 run 的 CSV 中 poi_code 列 (保持顺序与重复), 复现同一查询集。
-Read poi_code column from a prior-run CSV (keep order/duplicates) to reproduce the same query set.
-
-    用于 --codes-from-csv: warm 与 raw 喂同一份固定 POI 列表。
-    For --codes-from-csv: feed warm and raw the same fixed POI list.
+    """
+    Read poi_code from a previous CSV, preserving order and duplicates. --codes-from-csv
+    supplies the same fixed query sequence to warm and raw modes, avoiding sample drift from
+    unordered SELECT results.
     """
     codes: List[str] = []
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
@@ -1687,7 +1606,7 @@ Read poi_code column from a prior-run CSV (keep order/duplicates) to reproduce t
 def _fetch_poi_codes(
     session, pg_conn, poi_source: str,
 ) -> List[str]:
-    """获取指定 source 的所有要素编码。 / Get all feature codes for a given source."""
+    """Get all feature codes for a given source."""
     pt = SOURCE_TO_PG_TABLE.get(poi_source, "")
     if pg_conn and pt:
         cur = pg_conn.cursor()
@@ -1764,21 +1683,16 @@ def main():
               "--all --output result.csv")
         print()
         print("参数:")
-        print("  --code CODE            要素的 main_code")
-        print(f"  --poi-source SRC       要素 source "
-              f"(默认: {poi_source})")
-        print(f"  --parcel-source SRC    地块 source "
-              f"(默认: {parcel_source})")
-        print("  --batch N              批量测试 N 个")
-        print("  --all                  遍历所有要素")
-        print("  --output FILE          CSV 输出路径")
-        print("  --no-postgis           不对比 PostGIS")
-        print("  --hit-only N           仅保留命中记录，"
-              "补足至 N 条")
-        print("  --strategy STR         查询策略: "
-              "prefix (默认) / located_in")
-        print("  --codes-from-csv FILE  从已有 CSV 的 poi_code 列读取固定"
-              "查询集 (与 raw 对齐同一批 POI)")
+        print('  --code CODE            Query feature main_code')
+        print(f'  --poi-source SRC       Query feature source (default: {poi_source})')
+        print(f'  --parcel-source SRC    Parcel source (default: {parcel_source})')
+        print('  --batch N              Test N features')
+        print('  --all                  Process all features')
+        print('  --output FILE          Output CSV path')
+        print('  --no-postgis           Skip the PostGIS comparison')
+        print('  --hit-only N           Keep Hit records until N are collected')
+        print('  --strategy STR         Query strategy: prefix (default) / located_in')
+        print('  --codes-from-csv FILE  Reuse poi_code queries from CSV to align warm/raw runs')
         return
 
     mode_desc = ("单条查询" if single_code
@@ -1800,7 +1714,7 @@ def main():
     if output_csv:
         print(f"  输出文件:   {output_csv}")
 
-    # [1] 连接数据库 / [1] Connect databases
+    # [1] Connect databases
     print(f"\n[1] 连接数据库 ...")
     t0 = time.perf_counter()
     driver = GraphDatabase.driver(
@@ -1819,11 +1733,11 @@ def main():
         print(f"  PostGIS: {PG_CONFIG['host']}:{PG_CONFIG['port']}"
               f"/{PG_CONFIG['dbname']}  ({t_pg:.0f} ms)")
 
-        # ---- 公平性 setup: PG 预热 (pg_prewarm + ST_Contains throwaway) ---- / ---- fairness setup: PG warmup (pg_prewarm + ST_Contains throwaway) ----
-        # 论文 Methodology 应披露: 与 GR 端 PlanPolygonCache (内存常驻) / Methodology should disclose: counterpart to GR PlanPolygonCache (RAM-resident);
-        # 等价对照, PG 这边把 ST_Contains 涉及的表 + GiST + B-tree 全部 / on PG, pg_prewarm all tables + GiST + B-tree used by ST_Contains
-        # pg_prewarm 进 shared_buffers, 并跑一条 ST_Contains 形态的 / into shared_buffers, and run one ST_Contains-shaped
-        # dummy SQL 热 plan cache. / dummy SQL to warm the plan cache.
+        # ---- fairness setup: PG warmup (pg_prewarm + ST_Contains throwaway) ----
+        # Methodology should disclose: counterpart to GR PlanPolygonCache (RAM-resident);
+        # on PG, pg_prewarm all tables + GiST + B-tree used by ST_Contains
+        # into shared_buffers, and run one ST_Contains-shaped
+        # dummy SQL to warm the plan cache.
         from bench_setup import prepare_pg_warm
         used_tables = sorted({
             tbl for tbl in (
@@ -1846,7 +1760,7 @@ def main():
             ))
         prepare_pg_warm(pg_conn, used_tables, throwaway_sqls)
 
-    # 预加载邻域缓存 (neighbor 策略需要) / Preload neighborhood cache (needed by neighbor strategy)
+    # Preload neighborhood cache (needed by neighbor strategy)
     nb_cache = None
     if strategy == "neighbor":
         print(f"\n[1.5] 预加载 EAST_OF/NORTH_OF 邻居关系 ...")
@@ -1856,7 +1770,7 @@ def main():
         print(f"  缓存: {len(nb_cache):,} 条关系, "
               f"耗时 {t_nb:.0f} ms")
 
-    # [2] 查询 / [2] Query
+    # [2] Query
     if single_code:
         run_single_query(
             session, pg_conn,
@@ -1864,7 +1778,7 @@ def main():
             compare_pg, strategy=strategy,
             nb_cache=nb_cache)
     elif run_all or batch_n > 0 or codes_from_csv:
-        # 预加载多边形缓存 / Preload polygon cache
+        # Preload polygon cache
         print(f"\n[2] 预加载 {parcel_source} 多边形 ...")
         pc = PlanPolygonCache(session, verbose=True)
         t0 = time.perf_counter()
@@ -1873,10 +1787,10 @@ def main():
         print(f"    合计: {t_pp:.0f} ms, "
               f"{n_plans:,} 个地块已就绪")
 
-        # 预加载 plan parcel 共有前缀本地倒排索引 / Preload plan-parcel common-prefix local inverted index
-        # (与 PG pg_prewarm + GiST 等价对照: setup 阶段一次性 O(N) / (counterpart to PG pg_prewarm + GiST: one-time O(N) load at setup;
-        # 装载, 单条查询 O(1) hash 命中, 取代每条 POI 都打一次 / O(1) hash hit per query, replacing a Cypher prefix round-trip
-        # Cypher prefix 查询的高频网络往返) / on every POI)
+        # Preload plan-parcel common-prefix local inverted index
+        # (counterpart to PG pg_prewarm + GiST: one-time O(N) load at setup;
+        # O(1) hash hit per query, replacing a Cypher prefix round-trip
+        # on every POI)
         print(f"\n[2.5] 预加载 {parcel_source} 共有前缀倒排索引 ...")
         cp_idx = CommonPrefixIndex(
             session, parcel_source=parcel_source, verbose=True)
@@ -1886,11 +1800,11 @@ def main():
             print(f"    [警告] 未能加载共有前缀索引, "
                   f"回退到 Cypher 查询路径")
 
-        # 获取要素列表 / Fetch feature list
+        # Fetch feature list
         if codes_from_csv:
-            # 固定查询集: 精确复现既有 run (如 raw_reverse_overlay.csv), / Fixed query set: exactly reproduce a prior run (e.g. raw_reverse_overlay.csv),
-            # 使 warm 与 raw 评估严格相同的一批 POI; 不做抽样, 不依赖 / so warm and raw evaluate the same POI batch; no sampling; no reliance on
-            # (不确定的) SELECT 行序。 / (unstable) SELECT row order.
+            # Fixed query set: exactly reproduce a prior run (e.g. raw_reverse_overlay.csv),
+            # so warm and raw evaluate the same POI batch; no sampling; no reliance on
+            # (unstable) SELECT row order.
             print(f"\n[3] 读取固定 POI 查询集: {codes_from_csv} ...")
             poi_codes = _read_codes_from_csv(codes_from_csv)
             if not poi_codes:
@@ -1926,11 +1840,11 @@ def main():
                 f"reverse_query_{strategy}"
                 f"_N{n_label}_{ts}.csv")
 
-        # ---- 公平性 setup: 双侧 throwaway ---- / ---- fairness setup: dual-side throwaway ----
-        # 与距离 / 正向叠置实验保持一致: 跑前 5 条真实 query 丢弃,
-        # 同时热化 GR 端 (前缀 Cypher 候选 + Numba JIT PIP 编译) 与 / Warm GR (prefix Cypher candidates + Numba JIT PIP compile) and
-        # PG 端 (ST_Contains plan cache + GiST/B-tree page cache), / PG (ST_Contains plan cache + GiST/B-tree page cache) together,
-        # 之后才进入正式计时阶段. 论文 Methodology 段需披露此协议. / then enter the timed phase. Methodology must disclose this protocol.
+        # ---- fairness setup: dual-side throwaway ----
+        # As in the distance/forward-overlay experiments, discard the first five real warmup queries.
+        # Warm GR (prefix Cypher candidates + Numba JIT PIP compile) and
+        # PG (ST_Contains plan cache + GiST/B-tree page cache) together,
+        # then enter the timed phase. Methodology must disclose this protocol.
         n_throwaway = min(5, len(poi_codes))
         if n_throwaway > 0:
             print(f"\n[3.5] 双侧 throwaway: 丢弃前 {n_throwaway} 条 query "

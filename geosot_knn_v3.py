@@ -1,51 +1,27 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-GeoSOT KNN V3: 自适应网格剪枝 + STARTS WITH + 几何精排
-GeoSOT KNN V3: adaptive grid pruning + STARTS WITH + geometry rerank
+Legacy KNN V3 helpers: adaptive grid pruning, prefix queries, and optional geometry
+reranking. Find the finest safe level meeting the margin (default 100 m), query its prefix,
+widen to a 3x3 neighborhood or coarsen when needed, and rank centroids with cosine-weighted
+planar distance. This planar metric is an approximation, not a global ellipsoidal ordering
+guarantee. Optional edge/vertex reranking supports nonpoint geometries.
 
-算法 / Algorithm:
-  1. 确定安全层级 L: 最细的使查询点距网格边界 ≥ margin (默认 100m) 的层级
-     / Find safe level L: finest level where query-to-border distance ≥ margin (default 100m)
-  2. 用层级 L 的编码前缀执行第一 STARTS WITH 查询
-     / First STARTS WITH query using the prefix at level L
-  3. 候选不足则扩展到 3×3 邻域; 仍不足则逐级变粗, 直到候选充足
-     / If candidates insufficient, expand to 3×3; else coarsen level-by-level until enough
-  4. 排序: fast_code_to_center 质心距离 + cos(φ) 加权平面近似, 可选 Vincenty
-     / Rank by centroid distance via fast_code_to_center + cos(φ) weighted planar approx; optional Vincenty
-     (平面近似与真实测地单差一致量级, 排序等价; 报告时再转换为精确米)
-     / Planar approx error is small vs geodesic; ranking-equivalent; convert to meters when reporting
-  5. (可选) 几何精排: 查询为 LineString/Polygon 时, 用 edge/vertex 精确距离重排
-     / Optional geometry rerank for LineString/Polygon queries via edge/vertex exact distance
+V1 used level-digit graph traversal; V2 used circular quadtree filling; V3 uses a smaller
+prefix neighborhood. The published main KNN entry is V3.2, which depends on these helpers.
 
-与 V1 (geosot_knn_benchmark.py) 的区别 / vs V1:
-  - V1 通过 CC_HAS_LEVEL_k_DIGIT 图遍历找同前缀节点, 逐级回退+边界补齐
-  - V1 walks CC_HAS_LEVEL_k_DIGIT to find same-prefix nodes, level fallback + border fill
-  - V3 通过安全层级 + STARTS WITH + 3×3 邻域扩展, 更直接更高效
-  - V3 uses safe level + STARTS WITH + 3×3 expand; more direct and efficient
-  - V3 原生支持 Point/LineString/Polygon 全几何类型查询
-  - V3 natively supports Point/LineString/Polygon queries
+Neo4j prefix queries require an appropriate main_code index. The default PG reference uses
+an innermost GiST KNN candidate query, outer deduplication, and geography reranking; --pg-
+dedup additionally runs the slower DISTINCT ON alternative.
 
-与 V2 (geosot_knn_v2.py) 的区别 / vs V2:
-  - V2 用圆覆盖 + 竖直/水平的采样格点为种子, 生成大量编码前缀
-  - V2 seeds many prefixes via circle cover + vertical/horizontal sample grids
-  - V3 仅用 1~9 个前缀 (本级最多 3×3), 剪枝更激进
-  - V3 uses only 1–9 prefixes (at most 3×3); more aggressive pruning
-
-前置条件 / Prerequisites:
-  Neo4j TEXT 索引: CREATE TEXT INDEX FOR (n:GeoSOTCentroidCode) ON (n.main_code)
-  Neo4j TEXT index on GeoSOTCentroidCode.main_code
-
-PostGIS 基准 (默认) / PostGIS baseline (default):
-  GiST + ORDER BY geometry <-> 的 Standard 路径 (postgis_knn_standard);
-  GiST + ORDER BY geometry <-> Standard path (postgis_knn_standard);
-  另有 DISTINCT ON 的 Dedup 路径, 仅使用 --pg-dedup 时执行。
-  Optional DISTINCT ON Dedup path when --pg-dedup is set.
-
-使用方法 / Usage:
-    python geosot_knn_v3.py --queries 50 --k 1,3,5,10   # 多 K 值一并评估 / evaluate multiple K
-    python geosot_knn_v3.py --queries 10 --verbose   # 逐条详细输出 / per-query detail
-    python geosot_knn_v3.py --queries 100 --pg-dedup # 额外跑 PG Dedup 作对比 / also run PG Dedup
+Usage:
+    python geosot_knn_v3.py --queries 100
+    python geosot_knn_v3.py --queries 10 --k 10 --margin 200
+    python geosot_knn_v3.py --queries 50 --k 1,3,5,10
+    python geosot_knn_v3.py --queries 50 --k 5 --seed 7
+    python geosot_knn_v3.py --queries 50 --no-geometry
+    python geosot_knn_v3.py --queries 10 --verbose
+    python geosot_knn_v3.py --queries 100 --pg-dedup
 """
 
 import bisect as _bisect
@@ -84,7 +60,7 @@ except ImportError:
 
 
 # ============================================================================
-# Neo4j 配置 / Neo4j config
+# Neo4j config
 # ============================================================================
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
@@ -94,16 +70,16 @@ NEO4J_DATABASE = os.getenv("NEO4J_DB", "geocode")
 
 DEG_TO_M = 111_320.0
 
-# 并行几何精排: LCPC 剪枝后实际精排量通常远小于候选总数, 单线程足够。 / Parallel geometry rerank: after LCPC pruning, rerank volume is usually far below candidates; single-thread is enough.
-# 保留并行接口供消融实验使用, 默认设为极大值即可禁用。 / Keep a parallel API for ablation; set a huge default to disable.
+# Parallel geometry rerank: after LCPC pruning, rerank volume is usually far below candidates; single-thread is enough.
+# Keep a parallel API for ablation; set a huge default to disable.
 _GEO_PARALLEL_MIN = 100_000
 
-# LCPC bbox 下界的安全余量 (米): 补偿 GeoSOT 编码量化误差 (半格步长量级) / Safety margin (m) on LCPC bbox lower bound: compensates GeoSOT quantization error (~half cell step)
+# Safety margin (m) on LCPC bbox lower bound: compensates GeoSOT quantization error (~half cell step)
 _LCPC_SAFETY_M = 10.0
 
-# NumPy 批处理大小: 对真实工作负载 128-256 通常最优 / NumPy batch size: 128-256 is usually best for real workloads
-# (大 batch → 批内 continue 剪枝更充分; 小 batch → 批间 break 更及时) / (large batch → more continue-pruning inside batch; small batch → earlier break between batches)
-# 可在测试时通过环境变量覆盖: GEO_BATCH_SIZE=128 python ... / Override at test time via env: GEO_BATCH_SIZE=128 python ...
+# NumPy batch size: 128-256 is usually best for real workloads
+# (large batch → more continue-pruning inside batch; small batch → earlier break between batches)
+# Override at test time via env: GEO_BATCH_SIZE=128 python ...
 import os as _os
 _GEO_BATCH_SIZE: int = int(_os.environ.get("GEO_BATCH_SIZE", "256"))
 
@@ -139,11 +115,10 @@ def _geo_score_one_prepared_task(
     ],
 ) -> Tuple[str, float]:
     """
-    单候选几何距离精排 (供 ProcessPool 调用; 顶点坐标已预解码).
+    Rerank one geometry candidate in a ProcessPool worker using predecoded vertices.
 
-    @param task (mc, q_codes, q_coords, q_type, c_codes, c_coords, c_type,
-                 fallback_sq_deg2)
-    @returns (main_code, distance_m)
+    @param task (mc, q_codes, q_coords, q_type, c_codes, c_coords, c_type, fallback_sq_deg2).
+    @returns (main_code, distance_m).
     """
     import math as _math
 
@@ -167,11 +142,10 @@ def _geo_score_chunk_task(
     ],
 ) -> List[Tuple[str, float]]:
     """
-    批量候选几何精排 (供 ProcessPool 调用; 每批只传一次 query 顶点/坐标).
+    Rerank a batch in a ProcessPool worker, transmitting query vertices only once.
 
-    @param task (q_codes, q_coords, q_type,
-                 [(mc, c_codes, c_coords, c_type, fallback_sq), ...])
-    @returns [(main_code, distance_m), ...]
+    @param task (q_codes, q_coords, q_type, [(mc, c_codes, c_coords, c_type, fallback_sq), ...]).
+    @returns [(main_code, distance_m), ...].
     """
     q_codes, q_coords, q_type, items = task
     return [
@@ -183,43 +157,42 @@ def _geo_score_chunk_task(
 
 
 # ============================================================================
-# GR 端 KNN 候选 prefix 客户端缓存 (与 PG pg_prewarm 等价对照) / GR-side KNN candidate prefix client cache (counterpart to PG pg_prewarm)
+# GR-side KNN candidate prefix client cache (counterpart to PG pg_prewarm)
 # ============================================================================
 #
-# 论文 Methodology 披露 (与距离 / 正向叠置 / 反向叠置同口径): / Methodology disclosure (same protocol as distance / forward overlay / reverse overlay):
-#   PG 端用 pg_prewarm 把 poi_new 表 + GiST 索引拉进 shared_buffers; GR 端 / PG uses pg_prewarm to load poi_new + GiST into shared_buffers; GR
-#   把指定 geom_type (典型 'Point') 下的全部 main_code 一次性从 Neo4j 拉 / pulls all main_codes for a geom_type (typically Point) from Neo4j once
-#   到 Python 内存, 按字典序排序后用 bisect 做本地前缀匹配 / into Python memory, sorts lexicographically, and does local prefix match via bisect
-#   (O(log N + k)). 这是 graph-native warm-cache 协议在 KNN 算子上的 / (O(log N + k)). This is the graph-native warm-cache protocol for the KNN operator,
-#   对应实现, 与正向叠置 v7 的 MainCodeIndex / 反向叠置的 CommonPrefixIndex
-#   同款设计. / same design as MainCodeIndex (forward v7) / CommonPrefixIndex (reverse).
+# Benchmark protocol: disclose the same setup/measurement boundary as the other operators.
+# PG uses pg_prewarm to load poi_new + GiST into shared_buffers; GR
+# pulls all main_codes for a geom_type (typically Point) from Neo4j once
+# into Python memory, sorts lexicographically, and does local prefix match via bisect
+# (O(log N + k)). This is the graph-native warm-cache protocol for the KNN operator,
+# Corresponding implementation; follows the same client-side index design as forward-overlay MainCodeIndex
+# and reverse-overlay CommonPrefixIndex.
 #
-# 全程编码字符串, 不解码经纬度. RAM 占用 ~30 bytes × N_POI; 5M POI / Codes stay as strings; no lon/lat decode. RAM ~30 bytes × N_POI; 5M POI
-# 约 150 MB. / ≈ 150 MB.
+# Codes stay as strings; no lon/lat decode. RAM ~30 bytes × N_POI; 5M POI
+# ≈ 150 MB.
 
 class POIPrefixCache:
     """
-    GR 端 KNN 候选 prefix 客户端倒排索引 (与 PG pg_prewarm 等价对照).
-    GR-side KNN candidate prefix client inverted index (counterpart to PG pg_prewarm).
+    Client-side KNN prefix index built during explicit setup. Fetch main_codes by geometry type,
+    sort them, and match prefixes locally with bisect. This setup/materialization is reported
+    separately from measured queries.
 
-    Setup 阶段一次性从 Neo4j 拉取指定几何类型下的全部 main_code,
-    排序后通过 bisect 做本地前缀匹配。
-    At setup, pull all main_codes for given geometry types from Neo4j once,
-    sort, then local prefix match via bisect.
+    @attr _sorted Sorted codes keyed by geometry type.
+    @attr elapsed_sec Load time in seconds.
     """
 
     def __init__(self, session, geom_types: Iterable[str],
                  verbose: bool = True):
         """
-        @param session    Neo4j session
-        @param geom_types 要预加载的 geom_type 列表 (如 ["Point"]) / geom_types to preload (e.g. ["Point"])
-        @param verbose    是否打印进度 / whether to print progress
+        @param session Neo4j session.
+        @param geom_types Geometry types to preload, for example ["Point"].
+        @param verbose Whether to print progress.
         """
         self._sorted: Dict[str, List[str]] = {}
-        # 质心向量化加速 (点 KNN 主优化): 预计算全部 main_code 的质心, / Centroid vectorization (main point-KNN speedup): precompute centroids for all main_codes,
-        # 排序后排序数组对齐. _centers[gt] 形如 (N, 2) 的 (lon, lat) 数组, / aligned with the sorted array. _centers[gt] is (N,2) (lon,lat);
-        # _code_idx[gt] 为 main_code -> 行号 的映射. 候选排序时直接用 / _code_idx[gt] maps main_code -> row. Candidate ranking uses
-        # NumPy 切片 + argpartition 取 top-m, 避免逐候选 Python 解码+全排序. / NumPy slice + argpartition for top-m, avoiding per-candidate Python decode+full sort.
+        # Centroid vectorization (main point-KNN speedup): precompute centroids for all main_codes,
+        # aligned with the sorted array. _centers[gt] is (N,2) (lon,lat);
+        # _code_idx[gt] maps main_code -> row. Candidate ranking uses
+        # NumPy slice + argpartition for top-m, avoiding per-candidate Python decode+full sort.
         self._centers: Dict[str, "_np.ndarray"] = {}
         self._code_idx: Dict[str, Dict[str, int]] = {}
         t0 = time.perf_counter()
@@ -259,16 +232,18 @@ class POIPrefixCache:
         self, geom_type: str, codes: List[str], verbose: bool = False,
     ) -> None:
         """
-        预计算 codes 的质心数组 (lon, lat) 与 code->行号 映射, 供
-        rank_candidates 向量化排序. 解码失败的码用大哨兵值, 排序自然靠后.
-        Precompute centroid array (lon, lat) and code->row map for vectorized
-        rank_candidates. Failed decodes get a large sentinel and rank last.
+        Precompute centroid (lon,lat) arrays and code-to-row indexes for vectorized ranking. Invalid
+        codes receive a large sentinel and sort last.
+
+        @param geom_type Geometry-type key.
+        @param codes Sorted codes aligned with centroid rows.
+        @param verbose Whether to show progress.
         """
         if not _HAS_NP or not codes:
             return
         n = len(codes)
         arr = _np.empty((n, 2), dtype=_np.float64)
-        SENT = 1.0e9  # 解码失败哨兵 (经纬度不可能取到, 距离自然极大) / Decode-failure sentinel (impossible lon/lat; distance naturally huge)
+        SENT = 1.0e9  # Invalid-coordinate sentinel: impossible lon/lat values yield an extremely large distance.
         t_c = time.perf_counter()
         it = range(n)
         pbar = None
@@ -309,10 +284,17 @@ class POIPrefixCache:
         m: int,
     ) -> Optional[List[Tuple[str, float]]]:
         """
-        向量化候选排序: 用预计算质心 NumPy 切片 + argpartition 取 top-m,
-        替代逐候选 fast_code_to_center 解码 + 全量 Python sort。
-        Vectorized candidate ranking: NumPy slice of precomputed centroids +
-        argpartition for top-m, replacing per-candidate decode + full Python sort.
+        Rank candidates by gathering precomputed centroid rows and using NumPy argpartition for
+        Top-m, avoiding repeated decoding and a full Python sort.
+
+        @param geom_type Geometry-type key.
+        @param codes Candidate codes present in _sorted[geom_type].
+        @param q_lon Query longitude.
+        @param q_lat Query latitude.
+        @param cos2 Longitude weight cos(latitude)^2.
+        @param m Number of coarse leaders, usually max(coarse_top_n,k).
+        @returns Ascending [(code, squared_planar_degrees), ...], length <=m, or None when the NumPy
+            path is unavailable.
         """
         if not _HAS_NP:
             return None
@@ -346,13 +328,11 @@ class POIPrefixCache:
         exclude_code: Optional[str] = None,
     ) -> "Optional[_np.ndarray]":
         """
-        前缀批量匹配的"索引原生"版本: 返回命中码在 _sorted[geom_type] 中的
-        行号数组 (np.int64), 而非 main_code 字符串集合。
+        Index-native prefix retrieval: return deduplicated row indexes in _sorted[geom_type], not
+        code strings. Match the same candidates as find_by_prefixes_batch, using bisect ranges and
+        np.arange for direct rank_indices input.
 
-        与 find_by_prefixes_batch 命中同一批候选, 但跳过字符串集合构造,
-        bisect 出的 [lo, hi) 区间直接 np.arange, 供 rank_indices 零回查排序。
-
-        @returns 行号数组 (无序, 已去重); NumPy 不可用 / 无该类型时返回 None
+        @returns Unordered np.int64 row indexes, or None when NumPy/type data is unavailable.
         """
         if not _HAS_NP:
             return None
@@ -367,9 +347,9 @@ class POIPrefixCache:
                 parts.append(_np.arange(lo, hi, dtype=_np.int64))
         if not parts:
             return _np.empty(0, dtype=_np.int64)
-        # 同长度邻域 cell 前缀互不为前缀, [lo,hi) 区间天然不重叠且无重复, / Same-length neighbor cell prefixes are not prefixes of each other; [lo,hi) ranges are disjoint,
-        # 故直接 concatenate 即可, 无需 np.unique 排序 (跨轮去重由调用方 / so concatenate directly — no np.unique sort (cross-round dedup is caller's
-        # 的 np.union1d 负责)。 / np.union1d).
+        # Same-length neighbor cell prefixes are not prefixes of each other; [lo,hi) ranges are disjoint,
+        # so concatenate directly — no np.unique sort (cross-round dedup is caller's
+        # np.union1d).
         idx = parts[0] if len(parts) == 1 else _np.concatenate(parts)
         if exclude_code:
             ec = exclude_code.strip().upper()
@@ -388,10 +368,11 @@ class POIPrefixCache:
         m: int,
     ) -> Optional[List[Tuple[str, float]]]:
         """
-        基于行号数组的向量化排序: 直接用预计算质心 gather + argpartition 取
-        top-m, 相比 rank_candidates 省去 code->行号 的字典回查。
-        Vectorized ranking from row indices: gather precomputed centroids +
-        argpartition for top-m; skips code->row dict lookup vs rank_candidates.
+        Gather precomputed centroids by row index and use argpartition for Top-m, avoiding code-to-
+        row dictionary lookups.
+
+        @param idx np.int64 candidate row indexes valid for this geometry type.
+        @returns Ascending [(code, squared_planar_degrees), ...], length <=m, or None if unavailable.
         """
         if not _HAS_NP:
             return None
@@ -423,14 +404,12 @@ class POIPrefixCache:
         exclude_code: Optional[str] = None,
     ) -> Set[str]:
         """
-        批量前缀查询, 与 _query_candidates 的
-        UNWIND $prefixes + STARTS WITH 等价.
-        Batch prefix query, equivalent to _query_candidates'
-        UNWIND $prefixes + STARTS WITH.
+        Local equivalent of UNWIND prefixes with STARTS WITH.
 
-        @param geom_type    几何类型 / geometry type
-        @param prefixes     前缀列表 / prefix list
-        @returns            命中的 main_code 集合 / set of hit main_codes
+        @param geom_type Geometry-type filter key.
+        @param prefixes Prefix strings.
+        @param exclude_code Optional query code to omit, matching Cypher's exc parameter.
+        @returns Matching code set.
         """
         codes = self._sorted.get(geom_type)
         if not codes:
@@ -451,13 +430,50 @@ class POIPrefixCache:
         return (geom_type in self._sorted
                 and len(self._sorted[geom_type]) > 0)
 
+    @classmethod
+    def from_codes(
+        cls,
+        geom_type: str,
+        codes: Iterable[str],
+        verbose: bool = True,
+    ) -> "POIPrefixCache":
+        """
+        Build a prefix cache from an existing code list without Neo4j access.
 
-# 模块级单例, 由 main() 在 setup 阶段注入; None 时回退到 Cypher 查询 / Module-level singleton injected by main() at setup; None falls back to Cypher
+        @param geom_type Geometry-type key; Point for the paper's KNN experiment.
+        @param codes Centroid codes; validate G0, deduplicate, and sort internally.
+        @param verbose Whether to print count/timing.
+        @returns Cache suitable for set_poi_prefix_index.
+        """
+        obj = cls.__new__(cls)
+        obj._sorted = {}
+        obj._centers = {}
+        obj._code_idx = {}
+        t0 = time.perf_counter()
+        uniq = sorted({
+            str(c).strip().upper()
+            for c in codes
+            if c is not None
+            and is_valid_g0_code(str(c).strip().upper())
+        })
+        obj._sorted[geom_type] = uniq
+        if verbose:
+            print(f"  [poi_cache] {geom_type:<12s}: "
+                  f"{len(uniq):>9,} codes  (from list, no Neo4j)")
+        obj._precompute_centers(geom_type, uniq, verbose)
+        obj.elapsed_sec = time.perf_counter() - t0
+        if verbose:
+            print(f"  [poi_cache] 完成: 共 {len(uniq):,} 个 codes, "
+                  f"耗时 {obj.elapsed_sec * 1000:.0f} ms")
+        return obj
+
+
+# Module-level singleton injected by main() at setup; None falls back to Cypher
 _poi_prefix_index: Optional[POIPrefixCache] = None
 
 
 def set_poi_prefix_index(idx: Optional[POIPrefixCache]) -> None:
-    """注入 POI prefix 客户端索引 (None 时回到 cold-cache 模式). / Inject POI prefix client index (None → cold-cache mode)."""
+    """Inject POI prefix client index (None → cold-cache mode)."""
     global _poi_prefix_index
     _poi_prefix_index = idx
 
@@ -467,7 +483,7 @@ def get_poi_prefix_index() -> Optional[POIPrefixCache]:
 
 
 # ============================================================================
-# 辅助函数 / Helper functions
+# Helper functions
 # ============================================================================
 
 def pctile(data: List[float], p: float) -> float:
@@ -493,7 +509,10 @@ def run_status_line(
     last_len: List[int],
     bar_width: int = 22,
 ) -> None:
-    """单行 \\r 刷新: 进度条 + 本批 Recall + 平均 Recall + 耗时。 / Single-line \r refresh: progress + batch Recall + mean Recall + time."""
+    """
+    Single-line 
+    refresh: progress + batch Recall + mean Recall + time.
+    """
     pct = done / total if total else 0
     filled = int(bar_width * pct)
     bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
@@ -519,14 +538,14 @@ def run_status_line(
 
 
 # ============================================================================
-# 网格工具: 安全层级 + Z-order 3×3 邻域 / Grid utils: safe level + Z-order 3×3 neighborhood
+# Grid utils: safe level + Z-order 3×3 neighborhood
 # ============================================================================
 
 def _min_margin_m(
     point_lon: float, point_lat: float,
     bbox: Tuple[float, float, float, float],
 ) -> float:
-    """查询点到网格四条边界的最小距离（米，近似）。 / Min distance from query point to the four cell borders (meters, approx)."""
+    """Min distance from query point to the four cell borders (meters, approx)."""
     min_lon, max_lon, min_lat, max_lat = bbox
     cos_lat = math.cos(math.radians(point_lat))
     return min(
@@ -539,13 +558,9 @@ def _min_margin_m(
 
 def find_safe_level(code: str, min_margin_m: float = 100.0) -> int:
     """
-    找到最细的层级 L，使查询点距该层级网格边界 ≥ min_margin_m。
-    Find the finest level L where query-to-cell-border distance ≥ min_margin_m.
-
-    从全精度层级向粗层级搜索，返回第一个满足条件的层级。
-    Search from full precision toward coarser levels; return the first that qualifies.
-    该层级保证：半径 min_margin_m 内的所有近邻必定在同一网格内。
-    Guarantees all neighbors within radius min_margin_m lie in the same cell.
+    Search from the finest level toward coarser levels for the first cell whose minimum query-
+    to-boundary margin is at least min_margin_m. This defines the local coverage cell for the
+    requested margin.
     """
     code = code.strip().upper()
     max_level = len(code) - 2
@@ -561,7 +576,7 @@ def find_safe_level(code: str, min_margin_m: float = 100.0) -> int:
 
 
 def _prefix_to_rowcol(prefix: str) -> Tuple[int, int, int]:
-    """GeoSOT 前缀 → (lat_val, lon_val, level)。 / GeoSOT prefix → (lat_val, lon_val, level)."""
+    """GeoSOT prefix → (lat_val, lon_val, level)."""
     refine = prefix[2:]
     level = len(refine)
     lat_val = lon_val = 0
@@ -575,7 +590,7 @@ def _prefix_to_rowcol(prefix: str) -> Tuple[int, int, int]:
 def _rowcol_to_prefix(
     lat_val: int, lon_val: int, level: int, hemisphere: str = "0",
 ) -> str:
-    """(lat_val, lon_val, level) → GeoSOT 前缀。 / (lat_val, lon_val, level) → GeoSOT prefix."""
+    """(lat_val, lon_val, level) → GeoSOT prefix."""
     digits = []
     for i in range(level - 1, -1, -1):
         lat_bit = (lat_val >> i) & 1
@@ -585,7 +600,7 @@ def _rowcol_to_prefix(
 
 
 def get_3x3_neighbors(prefix: str) -> List[str]:
-    """获取网格 3×3 邻域（含自身，最多 9 个，边界处更少）。 / Get 3×3 cell neighborhood (includes self; at most 9; fewer near borders)."""
+    """Get 3×3 cell neighborhood (includes self; at most 9; fewer near borders)."""
     lat_val, lon_val, level = _prefix_to_rowcol(prefix)
     hemisphere = prefix[1]
     max_val = (1 << level) - 1
@@ -601,11 +616,11 @@ def get_3x3_neighbors(prefix: str) -> List[str]:
 
 
 # ============================================================================
-# 模块级几何精排辅助 (可被外部脚本直接调用, 无需实例化 Searcher) / Module-level geometry-rerank helpers (callable without a Searcher instance)
+# Module-level geometry-rerank helpers (callable without a Searcher instance)
 # ============================================================================
 
 def _lcp_of_codes(codes: List[str]) -> str:
-    """求 GeoSOT 编码列表的最长公共前缀. / Longest common prefix of a list of GeoSOT codes."""
+    """Longest common prefix of a list of GeoSOT codes."""
     if not codes:
         return ""
     prefix = codes[0]
@@ -621,7 +636,7 @@ def _lcpc_bbox_from_vcodes(
     vcodes: List[str],
     prefix_code: Optional[str] = None,
 ) -> Tuple[float, float, float, float]:
-    """从顶点编码（或预计算公共前缀）计算 LCPC bbox. / Compute LCPC bbox from vertex codes (or a precomputed common prefix)."""
+    """Compute LCPC bbox from vertex codes (or a precomputed common prefix)."""
     if prefix_code and len(prefix_code) >= 3:
         return code_to_bbox(prefix_code)
     if vcodes:
@@ -640,7 +655,10 @@ def _bbox_lb_m(
     bq: Tuple[float, float, float, float],
     bc: Tuple[float, float, float, float],
 ) -> float:
-    """两 bbox 距离保守下界 (米)，bbox = (min_lon, max_lon, min_lat, max_lat). / Conservative lower bound distance (m) between two bboxes; bbox=(min_lon,max_lon,min_lat,max_lat)."""
+    """
+    Conservative lower bound distance (m) between two bboxes;
+    bbox=(min_lon,max_lon,min_lat,max_lat).
+    """
     lon_gap = max(0.0, max(bq[0], bc[0]) - min(bq[1], bc[1]))
     lat_gap = max(0.0, max(bq[2], bc[2]) - min(bq[3], bc[3]))
     if lon_gap == 0.0 and lat_gap == 0.0:
@@ -659,22 +677,24 @@ def geometry_rerank_bb(
     lcpc_cache: Optional[Dict[str, Tuple[float, float, float, float]]] = None,
 ) -> Tuple[List[Tuple[str, float]], int]:
     """
-    LCPC 引导的 branch-and-bound 多边形精排（模块级, 可从外部直接调用）.
-    LCPC-guided branch-and-bound polygon rerank (module-level; callable externally).
+    Module-level LCPC-guided branch-and-bound geometry reranking, usable without a
+    GeoSotKNNSearcherV3 instance when vertex codes are already available.
 
-    无需 GeoSotKNNSearcherV3 实例, 适用于已拿到顶点编码的场景
-    （如 resident_knn 脚本）.
-    No GeoSotKNNSearcherV3 instance needed; for cases with vertex codes already
-    (e.g. resident_knn scripts).
+    @param q_vcodes Query vertex codes.
+    @param q_type Query geometry type.
+    @param candidates [(main_code, vertex_codes, geometry_type), ...].
+    @param k Requested Top-K.
+    @param lcpc_cache Shared LCPC bbox cache; None creates a temporary cache.
+    @returns (distance-sorted [(main_code, dist_m), ...], n_evaluated).
     """
     if lcpc_cache is None:
         lcpc_cache = {}
 
-    # 解码查询坐标 & 计算查询 LCPC bbox / Decode query coords & compute query LCPC bbox
+    # Decode query coords & compute query LCPC bbox
     q_coords = [fast_code_to_center(c) for c in q_vcodes]
     q_bbox = _lcpc_bbox_from_vcodes(q_vcodes)
 
-    # 为每个候选计算 lb 并排序 / Compute lb for each candidate and sort
+    # Compute lb for each candidate and sort
     items: List[Tuple[float, str, List[Tuple[float, float]], str]] = []
     for mc, vcodes, geo_type in candidates:
         c_coords = [fast_code_to_center(c) for c in vcodes]
@@ -746,14 +766,9 @@ def geometry_rerank_bb(
 
 class GeoSotKNNSearcherV3:
     """
-    GeoSOT KNN V3: 自适应网格剪枝 + STARTS WITH + 坐标推理排序。
-    GeoSOT KNN V3: adaptive grid pruning + STARTS WITH + coordinate-reasoning rank.
-
-    策略 / Strategy:
-      1. 确定安全层级 → 单网格 STARTS WITH → 3×3 邻域 → 逐级上升
-         / safe level → single-cell STARTS WITH → 3×3 → coarsen level-by-level
-      2. 质心距离粗排 + 可选几何精排
-         / centroid coarse rank + optional geometry rerank
+    V3 KNN searcher: choose a safe level, query its prefix and 3x3 neighbors, then coarsen as
+    needed. Coarse ranking uses cosine-weighted decoded centroids; optional edge/vertex
+    reranking handles nonpoint geometry.
     """
 
     def __init__(self, session, geom_type: str = "Point",
@@ -761,32 +776,32 @@ class GeoSotKNNSearcherV3:
         self._session = session
         self._geom_type = geom_type
         self._verbose = verbose
-        # VC + 几何类型进程内缓存 (跨查询复用, 不改变算法结果) / In-process VC + geometry-type cache (reused across queries; does not change algorithm results)
+        # In-process VC + geometry-type cache (reused across queries; does not change algorithm results)
         self._feat_cache: Dict[str, Dict] = {}
         self._coord_cache: Dict[Tuple[str, ...], List[Tuple[float, float]]] = {}
-        # LCPC bbox 缓存: main_code → (min_lon, max_lon, min_lat, max_lat) / LCPC bbox cache: main_code → (min_lon, max_lon, min_lat, max_lat)
+        # LCPC bbox cache: main_code → (min_lon, max_lon, min_lat, max_lat)
         self._lcpc_bbox_cache: Dict[str, Tuple[float, float, float, float]] = {}
         self._geo_pool = None
         self._geo_pool_workers = 0
 
-    # ---------- Neo4j 查询 ---------- / ---------- Neo4j queries ----------
+    # ---------- Neo4j queries ----------
 
     def _query_candidates(
         self, prefixes: Set[str], exclude_code: str,
     ) -> Set[str]:
         """
-        批量 STARTS WITH 查询候选 main_code (按几何类型过滤).
-        Batch STARTS WITH for candidate main_codes (filtered by geometry type).
-
-        优先走客户端 POIPrefixCache (与 PG pg_prewarm 等价对照, 完全在
-        Python 内存完成); 未注入时回退 Cypher.
-        Prefer client POIPrefixCache (PG pg_prewarm counterpart, fully in Python
-        memory); fall back to Cypher if not injected.
+        Batch prefix retrieval filtered by geometry type. Prefer an injected POIPrefixCache for
+        local in-memory matching; otherwise issue Cypher queries through Bolt. Cache materialization
+        and raw traversal are distinct execution modes.
         """
         cache = get_poi_prefix_index()
         if cache is not None and cache.has_geom_type(self._geom_type):
             return cache.find_by_prefixes_batch(
                 self._geom_type, prefixes, exclude_code=exclude_code)
+
+        if self._session is None:
+            raise RuntimeError(
+                "POI prefix cache is empty and no Neo4j session is bound")
 
         cypher = (
             "UNWIND $prefixes AS prefix\n"
@@ -809,11 +824,13 @@ class GeoSotKNNSearcherV3:
         self, codes: List[str],
     ) -> Dict[str, Dict]:
         """
-        从 Neo4j 批量拉取 VC + 几何类型 (无缓存层).
+        Fetch vertex codes and geometry types from Neo4j without a cache.
 
-        @returns {main_code: {"geometry_type": ..., "vertex_codes": [...]}}
+        @returns {main_code: {"geometry_type": ..., "vertex_codes": [...]}}.
         """
         if not codes:
+            return {}
+        if self._session is None:
             return {}
         try:
             rows = self._session.run(_FEATURE_INFO_CYPHER, codes=codes)
@@ -839,9 +856,9 @@ class GeoSotKNNSearcherV3:
         self, codes: List[str],
     ) -> Dict[str, Dict]:
         """
-        批量查询要素几何类型和顶点编码 (带进程内缓存).
+        Fetch vertex codes and geometry types with a process-local cache.
 
-        @returns {main_code: {"geometry_type": ..., "vertex_codes": [...]}}
+        @returns {main_code: {"geometry_type": ..., "vertex_codes": [...]}}.
         """
         if not codes:
             return {}
@@ -872,13 +889,12 @@ class GeoSotKNNSearcherV3:
         verbose: bool = False,
     ) -> Dict[str, float]:
         """
-        批量预拉取 VC + 几何类型到进程内缓存 (与 pg_prewarm 同口径 warm-cache).
+        Prefetch vertex codes and geometry types into the process cache during setup, without
+        changing KNN outputs.
 
-        仅缓存图读取结果, 不改变 KNN 算法输出.
-
-        @param codes      main_code 可迭代集合
-        @param batch_size UNWIND 批大小
-        @returns {n_total, n_hit, n_fetch, n_cached, elapsed_sec}
+        @param codes Iterable of main_codes.
+        @param batch_size UNWIND batch size.
+        @returns {n_total, n_hit, n_fetch, n_cached, elapsed_sec}.
         """
         norm = sorted({str(c).strip().upper() for c in codes if c})
         missing = [c for c in norm if c not in self._feat_cache]
@@ -917,7 +933,7 @@ class GeoSotKNNSearcherV3:
                 print(f"  [feat_cache] {done:,}/{len(missing):,} fetched")
         if pbar is not None:
             pbar.close()
-        # 顺带预热 LCPC bbox 缓存 (code_to_bbox 纯数学, 约 3–5s) / Also warm LCPC bbox cache (code_to_bbox is pure math, ~3–5s)
+        # Also warm LCPC bbox cache (code_to_bbox is pure math, ~3–5s)
         n_bbox = 0
         for mc, info in self._feat_cache.items():
             if mc not in self._lcpc_bbox_cache:
@@ -939,14 +955,14 @@ class GeoSotKNNSearcherV3:
         }
 
     def close(self) -> None:
-        """关闭搜索器持有的工程资源 (如几何精排进程池). / Close engineering resources held by the searcher (e.g. geometry-rerank pool)."""
+        """Close engineering resources held by the searcher (e.g. geometry-rerank pool)."""
         if self._geo_pool is not None:
             self._geo_pool.shutdown(wait=True)
             self._geo_pool = None
             self._geo_pool_workers = 0
 
     def _get_geo_pool(self, workers: int):
-        """复用几何精排进程池, 避免 Windows 下每条 query 反复 spawn. / Reuse the geometry-rerank process pool; avoid respawning per query on Windows."""
+        """Reuse the geometry-rerank process pool; avoid respawning per query on Windows."""
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
 
@@ -960,7 +976,7 @@ class GeoSotKNNSearcherV3:
 
     @staticmethod
     def _get_all_codes(mc: str, info: Dict) -> List[str]:
-        """获取要素编码列表（Point 用 main_code，其余用顶点编码）。 / Get feature code list (Point uses main_code; others use vertex codes)."""
+        """Get feature code list (Point uses main_code; others use vertex codes)."""
         if info.get("geometry_type") == "Point" or not info.get("vertex_codes"):
             return [mc.strip().upper()]
         return info["vertex_codes"]
@@ -969,13 +985,8 @@ class GeoSotKNNSearcherV3:
         self, codes: List[str],
     ) -> List[Tuple[float, float]]:
         """
-        将 GeoSOT 顶点编码解码为坐标并缓存。
-        Decode GeoSOT vertex codes to coordinates and cache them.
-
-        这里缓存的是单个编码中心点的确定性坐标；后续仍使用逐候选
-        cos_ref_matrix 计算距离判据, 因此不改变 rerank 结果口径。
-        Cached values are deterministic per-code centers; distance still uses
-        per-candidate cos_ref_matrix, so rerank semantics are unchanged.
+        Decode and cache deterministic grid-center coordinates for vertex codes. Candidate-specific
+        cos_ref_matrix weighting is still applied later, preserving the reranking metric.
         """
         key = tuple(codes)
         cached = self._coord_cache.get(key)
@@ -987,7 +998,7 @@ class GeoSotKNNSearcherV3:
 
     @staticmethod
     def _lcp_of(codes: List[str]) -> str:
-        """求 GeoSOT 编码列表的最长公共前缀 (LCPC). / Longest common prefix (LCPC) of a GeoSOT code list."""
+        """Longest common prefix (LCPC) of a GeoSOT code list."""
         if not codes:
             return ""
         prefix = codes[0]
@@ -1005,27 +1016,23 @@ class GeoSotKNNSearcherV3:
         prefix_code: Optional[str] = None,
     ) -> Tuple[float, float, float, float]:
         """
-        计算并缓存要素的 LCPC bbox (min_lon, max_lon, min_lat, max_lat).
-        Compute and cache feature LCPC bbox (min_lon, max_lon, min_lat, max_lat).
-
-        优先使用图中预计算的 GeoSOTCommonPrefixCode.prefix_code;
-        Prefer precomputed GeoSOTCommonPrefixCode.prefix_code in the graph;
-        否则从顶点编码推导.
-        otherwise derive from vertex codes.
+        Compute/cache LCPC bbox (min_lon,max_lon,min_lat,max_lat). Prefer the graph's precomputed
+        prefix_code; otherwise derive an LCP from vertex codes. For prefixes shorter than three
+        characters, use the union of vertex-cell boxes as the fallback extent.
         """
         cached = self._lcpc_bbox_cache.get(main_code)
         if cached is not None:
             return cached
 
         if prefix_code and len(prefix_code) >= 3:
-            # 图中预算的公共前缀, 最可靠 / Precomputed common prefix in the graph; most reliable
+            # Precomputed common prefix in the graph; most reliable
             bbox = code_to_bbox(prefix_code)
         elif codes:
             lcpc = self._lcp_of(list(dict.fromkeys(codes)))
             if len(lcpc) >= 3:
                 bbox = code_to_bbox(lcpc)
             else:
-                # LCPC 太短: 用顶点格并集, 始终包含整个多边形 / LCPC too short: use union of vertex cells; always covers the whole polygon
+                # LCPC too short: use union of vertex cells; always covers the whole polygon
                 bboxes = [code_to_bbox(c) for c in codes]
                 bbox = (
                     min(b[0] for b in bboxes),
@@ -1045,13 +1052,9 @@ class GeoSotKNNSearcherV3:
         bc: Tuple[float, float, float, float],
     ) -> float:
         """
-        两个 GeoSOT bbox 之间距离的保守下界 (米).
-        Conservative lower-bound distance (m) between two GeoSOT bboxes.
-
-        bbox 格式: (min_lon, max_lon, min_lat, max_lat).
-        bbox format: (min_lon, max_lon, min_lat, max_lat).
-        lon 方向使用最高纬度对应的米/度换算, 保证下界不乐观。
-        Longitude uses m/deg at the highest latitude so the bound is never optimistic.
+        Conservative inter-bbox distance lower bound in meters. Boxes are
+        (min_lon,max_lon,min_lat,max_lat); use the smallest longitude cosine at the highest latitude
+        to retain the lower-bound property.
         """
         lon_gap = max(0.0, max(bq[0], bc[0]) - min(bq[1], bc[1]))
         lat_gap = max(0.0, max(bq[2], bc[2]) - min(bq[3], bc[3]))
@@ -1073,13 +1076,14 @@ class GeoSotKNNSearcherV3:
         geo_workers: int = 0,
     ) -> Tuple[List[Tuple[str, float]], int, Dict[str, float]]:
         """
-        LCPC 引导的 branch-and-bound 几何精排.
-        LCPC-guided branch-and-bound geometry rerank.
+        LCPC-guided branch-and-bound geometry reranking. Process candidates in increasing bbox
+        lower-bound distance and stop when the next bound exceeds the current Kth geometry distance.
 
-        候选按 LCPC bbox 下界距离升序处理, 一旦下界超过当前第 K 名
-        的真实距离就提前终止, 大幅减少实际精排量。
-        Process candidates by ascending LCPC bbox lower-bound distance; stop early
-        when the bound exceeds the current K-th true distance, cutting rerank work.
+        @param k Top-K for the stopping condition.
+        @param geo_workers Worker interface; sufficiently large candidate sets can use parallel
+            processing.
+        @returns (ascending [(code,distance_m), ...], n_evaluated, timing), with t_lcpc_prune_ms,
+            t_exact_ms, and t_decode_ms.
         """
         _t = time.perf_counter
         t_decode = 0.0
@@ -1097,9 +1101,9 @@ class GeoSotKNNSearcherV3:
 
         _t_prune0 = _t()
 
-        # 为每个候选计算 LCPC bbox 下界 (纯编码空间, 不解码顶点坐标)。 / Compute LCPC bbox lower bound per candidate (code space only; no vertex decode).
-        # 排序键 = (lb, 质心距离): lb 为主, 质心距离作零解码的次级排序, / Sort key = (lb, centroid_dist): lb primary; centroid as zero-decode secondary key,
-        # 替代旧版需要解码全部顶点的 NumPy 重排。 / replacing old NumPy reordering that decoded all vertices.
+        # Compute LCPC bbox lower bound per candidate (code space only; no vertex decode).
+        # Sort key = (lb, centroid_dist): lb primary; centroid as zero-decode secondary key,
+        # replacing old NumPy reordering that decoded all vertices.
         items: List[Tuple[float, float, str, List[str], str]] = []
         for mc in top_codes:
             ci = c_raw.get(mc) or default_ci
@@ -1113,20 +1117,20 @@ class GeoSotKNNSearcherV3:
                           mc, c_codes, c_type))
         items.sort(key=lambda x: (x[0], x[1]))
 
-        # LCPC 剪枝准备阶段计时 (纯编码/网格, 不含解码) / LCPC prune prep timing (pure codes/grid; no decode)
+        # LCPC prune prep timing (pure codes/grid; no decode)
         t_lcpc_prune = (_t() - _t_prune0) * 1000
 
         top_k_heap: List[Tuple[float, str]] = []  # max-heap: (-dist, mc)
         computed: List[Tuple[str, float]] = []
 
-        # branch-and-bound + 延迟解码: 候选已按 (lb, 质心) 升序; 一旦 lb 超过 / branch-and-bound + lazy decode: candidates sorted by (lb, centroid); once lb exceeds
-        # 当前第 K 名距离, 后续全部更大, 直接 break。只有通过 lb 检查、真正 / current K-th distance, all later are larger — break. Only candidates that pass lb
-        # 需要精算的候选才解码坐标 (lazy decode), 避免对被剪枝候选无谓解码。 / and need exact distance get coords decoded (lazy decode); pruned ones stay undecoded.
+        # branch-and-bound + lazy decode: candidates sorted by (lb, centroid); once lb exceeds
+        # current K-th distance, all later are larger — break. Only candidates that pass lb
+        # and need exact distance get coords decoded (lazy decode); pruned ones stay undecoded.
         _decode_before = t_decode
         _t_exact0 = _t()
         for lb, fallback_sq, mc, c_codes, c_type_c in items:
             if len(top_k_heap) >= k and lb > -top_k_heap[0][0]:
-                break  # 已按 lb 升序, 后续 lb 只会更大 / Already sorted by lb ascending; later lb only grows
+                break  # Lower bounds are sorted; all subsequent lower bounds are at least this large.
 
             _td0 = _t()
             c_coords = self._coords_for_codes(c_codes)
@@ -1143,7 +1147,7 @@ class GeoSotKNNSearcherV3:
             elif dist < -top_k_heap[0][0]:
                 heapq.heapreplace(top_k_heap, (-dist, mc))
 
-        # 精确距离循环计时 (坐标空间): 循环墙钟扣除循环内解码时间 / Exact-distance loop timing (coord space): loop wall clock minus in-loop decode time
+        # Exact-distance loop timing (coord space): loop wall clock minus in-loop decode time
         t_exact = (_t() - _t_exact0) * 1000 - (t_decode - _decode_before)
 
         computed.sort(key=lambda x: x[1])
@@ -1154,7 +1158,7 @@ class GeoSotKNNSearcherV3:
         }
         return computed, len(computed), timing
 
-    # ---------- KNN 搜索 ---------- / ---------- KNN search ----------
+    # ---------- KNN search ----------
 
     def knn_search(
         self,
@@ -1167,26 +1171,26 @@ class GeoSotKNNSearcherV3:
         geo_workers: int = 0,
     ) -> Tuple[List[Tuple[str, float]], Dict]:
         """
-        V3 KNN 搜索。
+        Run legacy V3 KNN.
 
-        @param query_code       查询点 GeoSOT 编码
-        @param k                Top-K
-        @param min_margin_m     安全层级的最小边界距离 (米)
-        @param min_level        搜索最粗层级下界
-        @param coarse_top_n     进入几何精排的候选数上限
-        @param geometry_scoring 是否查询几何类型 (存在非 Point 时用 edge/vertex 重排)
-        @returns ([(main_code, approx_distance_m), ...], info_dict)
+        @param query_code Query GeoSOT code.
+        @param k Requested Top-K.
+        @param min_margin_m Safe-level minimum boundary margin in meters.
+        @param min_level Coarsest search level.
+        @param coarse_top_n Maximum coarse candidates for geometry reranking.
+        @param geometry_scoring Enable geometry-type lookup and edge/vertex reranking for nonpoints.
+        @returns ([(code, approximate_distance_m), ...], info).
         """
         _t = time.perf_counter
         query_code = query_code.strip().upper()
         query_center = fast_code_to_center(query_code)
 
-        # ---- 1. 确定安全层级 ---- / ---- 1. Determine safe level ----
+        # ---- 1. Determine safe level ----
         t0 = _t()
         safe_level = find_safe_level(query_code, min_margin_m)
         t_level = (_t() - t0) * 1000
 
-        # ---- 2. 渐进式候选搜索 + 边界校验 ---- / ---- 2. Progressive candidate search + boundary check ----
+        # ---- 2. Progressive candidate search + boundary check ----
         t0 = _t()
         cos_qlat = math.cos(math.radians(query_center[1]))
         cos2 = cos_qlat * cos_qlat
@@ -1195,16 +1199,16 @@ class GeoSotKNNSearcherV3:
         level = safe_level
         n_prefixes = 0
 
-        # Step A: 一律从 3×3 起步 (保证至少覆盖 margin + 1 个网格宽度) / Step A: always start from 3×3 (covers at least margin + one cell width)
+        # Step A: always start from 3×3 (covers at least margin + one cell width)
         prefix = query_code[:level + 2]
         neighbors = get_3x3_neighbors(prefix)
         cands = self._query_candidates(set(neighbors), query_code)
         candidates.update(cands)
         n_prefixes += len(neighbors)
 
-        # Step B: 排序 → 边界校验 → 按需扩展 / Step B: rank → boundary check → expand as needed
-        # 若第 K 个候选距离 ≥ 搜索边界的 70%, 说明真实 Top-K 可能被截断, / If K-th candidate distance ≥ 70% of search boundary, true Top-K may be truncated;
-        # 需要向更粗层级扩展。 / expand toward a coarser level.
+        # Step B: rank → boundary check → expand as needed
+        # If K-th candidate distance ≥ 70% of search boundary, true Top-K may be truncated;
+        # expand toward a coarser level.
         max_retries = 6
 
         def _rank_candidates() -> List[Tuple[str, float]]:
@@ -1262,10 +1266,10 @@ class GeoSotKNNSearcherV3:
                 "t_total_ms": round(t_level + t_search, 3),
             }
 
-        # ---- 3. 排序已在搜索阶段完成, 提取计时 ---- / ---- 3. Ranking finished in search; extract timings ----
-        t_rank = 0.0  # 包含在 t_search 中 / Included in t_search
+        # ---- 3. Ranking finished in search; extract timings ----
+        t_rank = 0.0  # Included in t_search.
 
-        # ---- 4. (可选) 几何精排: 仅当存在非 Point 类型时 ---- / ---- 4. (optional) geometry rerank: only when non-Point types exist ----
+        # ---- 4. (optional) geometry rerank: only when non-Point types exist ----
         t_geo = 0.0
         final_scored = rank_list
 
@@ -1312,7 +1316,7 @@ class GeoSotKNNSearcherV3:
 
             t_geo = (_t() - t0) * 1000
 
-        # ---- 输出: sqrt + 等距矩形近似 → 近似米 ---- / ---- output: sqrt + equirectangular approx → approx meters ----
+        # ---- output: sqrt + equirectangular approx → approx meters ----
         results = [(mc, math.sqrt(sq) * DEG_TO_M)
                    for mc, sq in final_scored[:k]]
 
@@ -1338,14 +1342,13 @@ def postgis_knn(
     pg_conn, query_code: str, k: int,
     oversample: int = 8,
 ) -> List[Tuple[str, float]]:
-    """PostGIS KNN (去重 + geography 精排), 返回 [(main_code, distance_m), ...].
-PostGIS KNN (dedup + geography rerank); returns [(main_code, distance_m), ...].
-
-    与 postgis_knn_standard 采用相同的"内层 KNN 取候选 + 外层精排"结构。
-    Same structure as postgis_knn_standard: inner KNN candidates + outer rerank.
+    """
+    PostGIS KNN with DISTINCT ON deduplication and geography reranking. Returns [(main_code,
+    distance_m), ...]. Like postgis_knn_standard, the inner query limits KNN candidates before
+    deduplication; only the outer deduplication mechanism differs.
     """
     cur = pg_conn.cursor()
-    # 先取出参考点几何 (EWKB, 含 SRID), 以字面量参数传入, 保证 <-> 右操作数为常量 / Fetch ref-point geometry (EWKB with SRID) as a literal param so <-> right operand is constant
+    # Fetch ref-point geometry (EWKB with SRID) as a literal param so <-> right operand is constant
     cur.execute(
         "SELECT ST_AsEWKB(geometry) FROM public.poi_new "
         "WHERE main_code = %s LIMIT 1",
@@ -1386,17 +1389,16 @@ def postgis_knn_standard(
     oversample: int = 8,
 ) -> List[Tuple[str, float]]:
     """
-    标准 PostGIS GiST KNN + 去重.
-    Standard PostGIS GiST KNN + deduplication.
-
-    关键修正 (索引短路): 把 KNN 超取 (ORDER BY geom <-> ref LIMIT k*oversample)
-    单独放在最内层子查询, 保证 GiST KNN 索引可以被使用。
-    Critical fix (index short-circuit): keep KNN over-fetch
-    (ORDER BY geom <-> ref LIMIT k*oversample) in the innermost subquery so the
-    GiST KNN index can be used.
+    PostGIS GiST KNN with bounded overfetch and deduplication. Keep ORDER BY geometry <->
+    reference LIMIT k*oversample in the innermost query without windows or DISTINCT, allowing
+    index early termination. Apply ROW_NUMBER deduplication and geography reranking only to
+    those candidates. Combining the window and LIMIT at the same level previously forced large
+    scans/sorts. Bind the reference as a constant %s::geometry parameter to support the KNN
+    index plan. Finite overfetch remains a reference protocol, not an exhaustive accuracy
+    guarantee.
     """
     cur = pg_conn.cursor()
-    # 先取出参考点几何 (EWKB, 含 SRID), 以字面量参数传入 / Fetch ref-point geometry (EWKB with SRID) as a literal param
+    # Fetch ref-point geometry (EWKB with SRID) as a literal param
     cur.execute(
         "SELECT ST_AsEWKB(geometry) FROM public.poi_new "
         "WHERE main_code = %s LIMIT 1",
@@ -1434,7 +1436,7 @@ def postgis_knn_standard(
 
 
 # ============================================================================
-# 主流程 / Main flow
+# Main flow
 # ============================================================================
 
 def main():
@@ -1547,9 +1549,9 @@ def main():
     print(f"  Connected ({(time.perf_counter() - t0) * 1000:.0f} ms)"
           f"  geom_type filter: {geom_type}")
 
-    # ---- 公平性 setup: PG 预热 + 双侧 throwaway ---- / ---- fairness setup: PG warmup + dual-side throwaway ----
-    # 论文 Methodology 应披露: GR / PG 均在 warm-cache + warm plan
-    # cache 下计时, 与 GR 内置的 lru_cache / Neo4j page cache 同口径.
+    # ---- fairness setup: PG warmup + dual-side throwaway ----
+    # Benchmark protocol: time both G3R and PostGIS with warm data/plan caches,
+    # consistent with G3R's lru_cache and the Neo4j page cache. Report setup separately.
     from bench_setup import prepare_pg_warm
     prepare_pg_warm(
         pg_conn,
@@ -1559,7 +1561,7 @@ def main():
         ],
     )
 
-    # GR + PG 双侧 throwaway: 用 5 条 dummy query 同时热两侧, 丢弃结果 / GR+PG dual throwaway: warm both sides with 5 dummy queries; discard results
+    # GR+PG dual throwaway: warm both sides with 5 dummy queries; discard results
     n_throwaway = min(5, len(query_codes))
     if n_throwaway > 0:
         print(f"  Throwaway: GR/PG 双侧丢弃前 {n_throwaway} 条 query")
@@ -1578,7 +1580,7 @@ def main():
     print("  Warmup done")
 
     # ================================================================
-    # 4. Run queries (支持断点续跑: 已存在的 CSV 中的 query_code 会跳过) / 4. Run queries (supports resume: query_codes already in CSV are skipped)
+    # 4. Run queries (supports resume: query_codes already in CSV are skipped)
     # ================================================================
 
     CSV_FIELDS = [
@@ -1656,7 +1658,7 @@ def main():
 
     for r_idx, qc in enumerate(remaining):
         idx = skipped + r_idx
-        # --- Graph V3 KNN (用 k_max 查一次) --- / --- Graph V3 KNN (query once at k_max) ---
+        # --- Graph V3 KNN (query once at k_max) ---
         tg0 = time.perf_counter()
         gr_results, gr_info = searcher.knn_search(
             qc, k=k_max, min_margin_m=margin, min_level=min_level,
@@ -1664,7 +1666,7 @@ def main():
         tg1 = time.perf_counter()
         t_gr_us = (tg1 - tg0) * 1e6
 
-        # --- PostGIS KNN Standard (用 k_max 查一次) --- / --- PostGIS KNN Standard (query once at k_max) ---
+        # --- PostGIS KNN Standard (query once at k_max) ---
         tps0 = time.perf_counter()
         pgs_results = postgis_knn_standard(pg_conn, qc, k_max)
         tps1 = time.perf_counter()
@@ -1683,7 +1685,7 @@ def main():
             if not pg_dedup_results:
                 continue
 
-        # --- 对每个 K 值评估并记录 --- / --- Evaluate and record for each K ---
+        # --- Evaluate and record for each K ---
         last_recall = 0.0
         for kv in k_list:
             if (qc, kv) in done_keys:
@@ -1751,7 +1753,7 @@ def main():
 
             last_recall = recall
 
-        # --- 状态行 (用 k_max 的 recall) --- / --- Status line (recall at k_max) ---
+        # --- Status line (recall at k_max) ---
         kmax_s = per_k_stats[k_max]
         mean_r = (statistics.mean(kmax_s["recall"])
                   if kmax_s["recall"] else 0)
@@ -1830,7 +1832,7 @@ def main():
 
 
 # ============================================================================
-# 统计输出 / Statistics output
+# Statistics output
 # ============================================================================
 
 def print_summary(W, k, n, recall_list, t_gr, t_pg, t_pgs,
@@ -1863,7 +1865,7 @@ def print_summary(W, k, n, recall_list, t_gr, t_pg, t_pgs,
           f"P75={pctile(recall_list, 75):.2f}  "
           f"P99={pctile(recall_list, 99):.2f}")
 
-    # --- PostGIS dedup vs standard agreement (仅 --pg-dedup) --- / --- PostGIS dedup vs standard agreement (--pg-dedup only) ---
+    # --- PostGIS dedup vs standard agreement (--pg-dedup only) ---
     if run_pg_dedup:
         agree_n = sum(1 for a in pg_agree if a == 1)
         print(f"\n  PostGIS Dedup vs Standard Agreement:")

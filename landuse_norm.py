@@ -1,53 +1,38 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-用地功能(LUFunctionGroup)归一化模块 —— 供错配实验复用。
-Land-use function (LUFunctionGroup) normalization — reused by the mismatch experiment.
+Normalize LUFunctionGroup names for the mismatch experiment. classify(raw) returns
+(land_class,land_subtype), retaining original Chinese category values as functional data.
+Classes are residential, nonresidential, and mixed; nonresidential subtypes distinguish
+industrial/storage, commercial/office, green/water, tourism, transport, utilities,
+education, healthcare, recreation, administration/special, welfare, supporting facilities,
+reserve, and other uses.
 
-核心产出 / Core output:
-    classify(raw) -> (land_class, land_subtype)
-      land_class  ∈ {住宅, 非住宅, 混合}
-      land_subtype: 非住宅的细分(工业仓储/商业办公/绿地水域/风景旅游/交通设施/
-                    市政公用/教育科研/医疗卫生/文体娱乐/行政特殊/社会福利/
-                    配套设施/发展备用控制/其他非住宅); 住宅/混合固定回其类名。
-      land_subtype: non-residential subtypes (industrial-storage / commercial-office /
-                    green-water / scenic-tourism / transport / municipal / education-R&D /
-                    medical / culture-sports / admin-special / social-welfare /
-                    supporting / reserve-control / other-non-res); residential/mixed
-                    echo their class name.
-
-设计原则(重要) / Design principles (important):
-  * 保守偏"住宅": 含糊的居住相关一律归住宅 —— 因为错配实验里把非住宅误判成
-    住宅只是漏掉候选(保守), 把住宅误判成非住宅才会制造假错配。
-    Bias toward "residential": ambiguous dwelling-related labels → residential —
-    misclassifying non-res as res only drops candidates (conservative); the reverse
-    fabricates false mismatches.
-  * "住宅区/居住区 + 绿地/道路/停车" = 居住区内基础设施, 非居住空间 → 非住宅。
-    "Residential zone + green/road/parking" = in-zone infrastructure, not dwelling → non-res.
-  * 商住 / 居住+(商业/办公/工业/服务业/医疗) = 混合。
-    Mixed commercial-residential / dwelling+(commercial/office/industrial/service/medical) = mixed.
-  * 商务/办公/酒店/旅馆公寓 = 商业; 单身公寓/单身宿舍/公寓 = 住宅。
-    Business/office/hotel/inn apartments = commercial; bachelor apt/dorm/apartment = residential.
+Ambiguous dwelling-related uses default conservatively to residential to avoid false
+mismatch flags. Residential-area infrastructure such as roads/parking/green space is
+nonresidential; housing combined with business/office/industry/services/healthcare is mixed.
+Business offices/hotels/serviced apartments are commercial; ordinary apartments and
+dormitories are residential.
 """
 from __future__ import annotations
 import re
 from typing import Tuple
 
-# 强非住宅信号(与居住共现即判混合) / Strong non-residential signals (co-occur with dwelling → mixed)
+# Strong non-residential signals (co-occur with dwelling → mixed)
 NONRES_STRONG = ("商业", "商务", "办公", "工业", "服务业", "医疗", "旅馆",
                  "酒店", "金融", "产业")
 
-# 居住区内基础设施(即使含居住/住宅也算非住宅) / In-zone infrastructure (non-res even if text has dwelling/residential)
+# In-zone infrastructure (non-res even if text has dwelling/residential)
 _ZONE_PREFIX = ("住宅区", "居住区")
 _ZONE_INFRA = ("绿地", "道路", "停车")
 
-# 公寓当住宅的排除前缀(这些是商业性公寓) / Prefixes that exclude apartments from residential (commercial apts)
+# Prefixes that exclude apartments from residential (commercial apts)
 _APT_COMMERCIAL = ("商务", "办公", "酒店", "旅馆", "商业")
 
-# 截断/缩写的居住类 / Truncated/abbreviated residential labels
+# Truncated/abbreviated residential labels
 _RES_ABBR = {"一类", "二类", "三类", "四类", "五类", "类居住", "二类居"}
 
-# 非住宅细分关键词(有序; 先匹配者胜) / Non-residential subtype keyword rules (ordered; first match wins)
+# Non-residential subtype keyword rules (ordered; first match wins)
 _SUBTYPE_RULES = [
     ("发展备用控制", ("填海", "白色用地", "发展备用", "备用地", "备用", "控制",
                   "限制", "城市建设", "未利用", "发展用地", "综合发展",
@@ -83,7 +68,7 @@ _SUBTYPE_RULES = [
 
 
 def normalize(raw: str) -> str:
-    """清洗: 去换行/空白, 全角＋→+, 全角括号统一。 / Clean: strip newlines/whitespace, fullwidth ＋→+, unify fullwidth parentheses."""
+    """Clean: strip newlines/whitespace, fullwidth ＋→+, unify fullwidth parentheses."""
     if raw is None:
         return ""
     s = str(raw)
@@ -117,12 +102,12 @@ def _subtype(s: str) -> str:
 
 
 def classify(raw: str) -> Tuple[str, str]:
-    """返回 (land_class, land_subtype)。 / Return (land_class, land_subtype)."""
+    """Return (land_class, land_subtype)."""
     s = normalize(raw)
     if not s:
         return ("非住宅", "其他非住宅")
 
-    # 显式混合 / Explicit mixed
+    # Explicit mixed
     if "商住" in s or s in ("混合用地", "混合"):
         return ("混合", "混合")
 

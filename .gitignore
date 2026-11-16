@@ -1,48 +1,52 @@
-﻿# Python
-__pycache__/
-*.py[cod]
+# Environment and credentials
 .venv/
 venv/
-.cache/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
 
-# IDE
+# Generated Python files
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+
+# Research data and cached exports
+csv/
+recover_out/
+data/private/
+data/raw/
+*.pkl
+*.pickle
+*.dump
+*.bak
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.gpkg
+**/.tile_cache/
+**/.cache*/
+cache/
+
+# Generated experiments and plots
+benchmark_*/
+raw_benchmark_*/
+paper_figures/
+output/
+logs/
+tmp/
+*.log
+*.zip
+*.rar
+
+# Local preparation notes; retain locally, exclude from publication
+/open_source_manifest.csv
+/开源文件清单.md
+
+# Editors
 .idea/
 .vscode/
 .DS_Store
-
-# Credentials
-.env
-.env.*
-*.pem
-*.key
-
-# Restricted data
-data/raw/
-data/private/
-raw_data/
-private_data/
-restricted_data/
-resident_data/
-neo4j-data/
-postgres-data/
-
-# Database dumps and archives
-*.dump
-*.bak
-*.7z
-*.zip
-
-# Generated files
-logs/
-tmp/
-paper_figures/
-benchmark_outputs/
-
-# CSV files are ignored by default
-*.csv
-
-# Curated public results and examples may be included
-!results/
-!results/**/*.csv
-!examples/
-!examples/**/*.csv

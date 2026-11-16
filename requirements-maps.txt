@@ -1,0 +1,5 @@
+# Optional imports used by make_uv_figures.py.
+# Install requirements.txt first.
+contextily
+folium
+pyproj
